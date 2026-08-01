@@ -1,0 +1,14 @@
+[package]
+name = "medienzeit-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Rendering is deliberately generic over `DrawTarget`, so the host simulator and the
+# real SSD1681 panel run byte-identical drawing code.
+
+[dependencies]
+medienzeit-core.workspace = true
+embedded-graphics.workspace = true
+u8g2-fonts = { version = "0.7", features = ["embedded_graphics_textstyle"] }
+heapless.workspace = true

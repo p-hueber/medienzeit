@@ -1,0 +1,15 @@
+[package]
+name = "medienzeit-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Host-side virtual display. Drives the *real* `medienzeit-core` ledger against a
+# fake clock and renders through the *real* `medienzeit-ui`, so what you see here is
+# what the panel will show.
+
+[dependencies]
+medienzeit-core.workspace = true
+medienzeit-ui.workspace = true
+embedded-graphics.workspace = true
+embedded-graphics-simulator = "0.8.0"
