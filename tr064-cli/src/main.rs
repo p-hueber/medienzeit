@@ -105,7 +105,7 @@ fn call(cfg: &Config, action: &Action, body: &str) -> Result<String, String> {
     }
 
     let challenge_header = header(&headers, "www-authenticate")
-        .ok_or("box returned 401 without a WWW-Authenticate header")?;
+        .ok_or("FRITZ!Box returned 401 without a WWW-Authenticate header")?;
     let challenge = digest::Challenge::parse(challenge_header).map_err(|e| e.to_string())?;
     let auth: heapless::String<512> = challenge
         .authorization(&cfg.user, &cfg.pass, "POST", action.control_url, 1, &cnonce())

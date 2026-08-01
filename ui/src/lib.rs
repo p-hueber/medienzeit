@@ -48,17 +48,21 @@ impl Default for Chrome<'_> {
 
 /// Numbers and colon only, which is why anything with a minus sign or a letter uses
 /// [`title_font`] instead.
+///
+/// The label fonts are the `_tf` (Latin-1) variants rather than `_tr` (ASCII), so German
+/// umlauts render properly. Worth the extra flash: "zurücklegen" spelled "zuruecklegen"
+/// on a device a child reads every day is a small daily insult.
 fn hero_font() -> FontRenderer {
     FontRenderer::new::<fonts::u8g2_font_logisoso62_tn>()
 }
 fn title_font() -> FontRenderer {
-    FontRenderer::new::<fonts::u8g2_font_helvB18_tr>()
+    FontRenderer::new::<fonts::u8g2_font_helvB18_tf>()
 }
 fn label_font() -> FontRenderer {
-    FontRenderer::new::<fonts::u8g2_font_helvB10_tr>()
+    FontRenderer::new::<fonts::u8g2_font_helvB10_tf>()
 }
 fn small_font() -> FontRenderer {
-    FontRenderer::new::<fonts::u8g2_font_helvR08_tr>()
+    FontRenderer::new::<fonts::u8g2_font_helvR08_tf>()
 }
 
 /// Minutes, rounded *up*, so "1" shows until the time is truly gone.
@@ -156,9 +160,9 @@ where
     if snap.balance_secs < 0 {
         let _ = write!(sub, "Minus {} Min", minutes_ceil(-snap.balance_secs));
     } else if snap.docked.iter().all(|d| *d) {
-        let _ = sub.push_str("laedt wieder auf");
+        let _ = sub.push_str("lädt wieder auf");
     } else {
-        let _ = sub.push_str("in die Box legen");
+        let _ = sub.push_str("zurücklegen");
     }
     let _ = label_font().render_aligned(
         sub.as_str(),
@@ -171,7 +175,7 @@ where
 
     if snap.balance_secs < 0 && !snap.docked.iter().all(|d| *d) {
         let _ = small_font().render_aligned(
-            "in die Box legen",
+            "zurücklegen",
             Point::new(cx, 124),
             VerticalPosition::Center,
             HorizontalAlignment::Center,
@@ -262,7 +266,7 @@ where
     for (i, name) in chrome.device_names.iter().enumerate() {
         let x = 8 + i as i32 * half;
 
-        // Filled square = on the cradle, hollow = out of the box.
+        // Filled square = within the reader's field, hollow = taken away.
         let box_rect = Rectangle::new(Point::new(x, 168), Size::new(12, 12));
         if snap.docked[i] {
             box_rect.into_styled(PrimitiveStyle::with_fill(fg)).draw(target)?;

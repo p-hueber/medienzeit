@@ -42,8 +42,8 @@ pub enum Event {
     Warning,
     NightBegan,
     NightEnded,
-    /// A device left its cradle during the night window. The router block does
-    /// nothing about offline use, so this alert is the actual enforcement.
+    /// A device was taken away from the reader during the night window. The router
+    /// block does nothing about offline use, so this alert is the actual enforcement.
     UndockedAtNight { device: usize },
     /// A tick gap larger than [`MAX_TICK_GAP_SECS`] was ignored.
     TimeJump { gap_secs: i64 },
@@ -58,6 +58,8 @@ pub struct Snapshot<const N: usize> {
     /// May be negative, down to [`Policy::floor`].
     pub balance_secs: i32,
     pub cap_secs: u32,
+    /// Per device: within the reader's field. Says nothing about where that field is
+    /// or what shape the installation takes — only that the device has been put back.
     pub docked: [bool; N],
     /// Whether the FRITZ!Box currently sees each device on the home network.
     pub present: [bool; N],
@@ -65,8 +67,8 @@ pub struct Snapshot<const N: usize> {
     pub night: bool,
     pub in_grace: bool,
     pub grace_remaining_secs: u32,
-    /// Per device. A docked device is never blocked — that is what keeps a reason to
-    /// put it back once the balance is gone.
+    /// Per device. A device at the reader is never blocked — that is what keeps a
+    /// reason to put it back once the balance is gone.
     pub blocked: [bool; N],
     pub local: LocalDateTime,
 }
@@ -96,7 +98,7 @@ pub struct Ledger<const N: usize> {
     draining_since: Option<i64>,
     was_exhausted: bool,
     was_night: bool,
-    /// Per device: was it already out of the box during the night window last tick?
+    /// Per device: was it already away from the reader during the night window last tick?
     night_offence: [bool; N],
     warned: bool,
 }
@@ -113,10 +115,10 @@ impl<const N: usize> Ledger<N> {
             balance_secs,
             pending_secs: 0,
             refill_remainder: 0,
-            // Assume docked until a reader says otherwise: fail *closed* on the clock,
-            // so a reader that never comes up cannot silently drain the balance.
+            // Assume present at the reader until told otherwise: fail *closed* on the
+            // clock, so a reader that never comes up cannot silently drain the balance.
             docked: [true; N],
-            // Assume absent until the FRITZ!Box says otherwise, for the same reason —
+            // Assume away from home until the FRITZ!Box says otherwise, same reason —
             // draining requires positive evidence that she is home.
             present: [false; N],
             last_tick: None,
@@ -137,8 +139,8 @@ impl<const N: usize> Ledger<N> {
         self.balance_secs = (self.balance_secs + secs as i32).min(policy.cap_secs as i32);
     }
 
-    /// A device counts as in use when it is off its cradle *and* the box can see it on
-    /// the home network. Off-network means out of the house, which is free.
+    /// A device counts as in use when it is away from the reader *and* the FRITZ!Box
+    /// can see it on the home network. Off-network means out of the house, which is free.
     fn in_use_at_home(&self) -> bool {
         (0..N).any(|i| !self.docked[i] && self.present[i])
     }
@@ -240,7 +242,8 @@ impl<const N: usize> Ledger<N> {
         }
         self.last_tick = Some(utc);
 
-        // A docked device is never blocked, so docking always restores something.
+        // A device that has been put back is never blocked, so returning it always
+        // restores something.
         let mut blocked = [false; N];
         let lock_out = night || self.balance_secs <= 0;
         for (i, b) in blocked.iter_mut().enumerate() {

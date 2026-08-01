@@ -53,7 +53,7 @@ pub struct Policy {
     /// for every `refill_den` seconds spent not using the devices.
     ///
     /// The default 1:10 means "ten minutes not using earns one minute of screen time",
-    /// so a 21:00–07:00 night in the box funds an hour the next day. A ratio explains
+    /// so a 21:00–07:00 night within the reader's field funds an hour the next day. A ratio explains
     /// far better to a child than a rate, and keeping it rational keeps the accounting
     /// integer-exact — no drift from repeated float rounding.
     pub refill_num: u32,
@@ -69,7 +69,7 @@ pub struct Policy {
     /// Balance a freshly provisioned ledger starts with, so day one is not spent
     /// staring at an empty bank.
     pub prefill_secs: u32,
-    /// How long a device may be off its cradle before the balance starts draining.
+    /// How long a device may be away from the reader before the balance starts draining.
     ///
     /// Covers picking a phone up to skip a track or answer a message. Billing is
     /// **retroactive**: cross the threshold and the whole pickup is charged, so short

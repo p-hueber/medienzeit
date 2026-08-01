@@ -1,11 +1,16 @@
 # Medienzeit
 
-A chess clock for screen time. A shared daily budget drains while a device is off its
-charging cradle and stops while it is docked. A 1.54" e-ink display shows what is
-left. At zero the Fritz!Box cuts the devices off the internet.
+A chess clock for screen time. A shared balance refills while the devices are put back
+at the reader — or away from home — and drains while they are in use at home. A 1.54"
+e-ink display shows what is left. At zero, the FRITZ!Box cuts the devices off the
+internet, but only the ones that have been taken away.
 
 Enforcement lives in the network and in the room, not on the phones, so it works the
 same for Android and iOS with nothing installed on either.
+
+The installation shape is deliberately undecided. Nothing in the code assumes the
+devices go in a container, on a stand, or anywhere in particular — only that they are
+within the reader's field or they are not.
 
 Full design, hardware BOM and milestones: `~/.claude/plans/so-i-have-issues-melodic-spring.md`.
 
@@ -48,7 +53,7 @@ Simulator keys:
 
 | | |
 |---|---|
-| `1` / `2` | dock or undock device 1 / 2 |
+| `1` / `2` | put device 1 / 2 back, or take it away |
 | `3` / `4` | toggle device 1 / 2 on the home network (simulate leaving the house) |
 | `space` | pause the simulated clock |
 | `up` / `down` | double or halve clock speed (starts at 60x — one budget-minute per second) |
@@ -69,28 +74,29 @@ is the whole model.
 
 | Situation | Balance | Internet |
 |---|---|---|
-| Docked at home | fills | on |
+| Put back, at home | fills | on |
 | In use at home | drains 1× | on |
 | Brief pickup, under `grace_secs` | held | on |
 | …that pickup runs long | drains, **billed from the pickup** | on |
 | Out of the house (off the home network) | fills | on |
-| Night, docked | fills | on |
-| Night, undocked | held | **blocked** + alert |
-| Balance at zero, undocked | drains toward the floor | **blocked** |
-| Balance below zero, docked | fills back out of the hole | on |
+| Night, put back | fills | on |
+| Night, taken away | held | **blocked** + alert |
+| Balance at zero, taken away | drains toward the floor | **blocked** |
+| Balance below zero, put back | fills back out of the hole | on |
 
 - **Refill is a ratio, not a rate.** The default 1:10 means "ten minutes not using earns
-  one minute of screen time", so a 21:00–07:00 night in the box funds an hour. A ratio
+  one minute of screen time", so a 21:00–07:00 night at the reader funds an hour. A ratio
   explains to a child; a rate does not. Kept rational so the accounting is integer-exact.
 - **Wall clock, not device-minutes.** Any device out drains at 1×. Both out still 1×.
 - **Being out earns exactly what being docked earns.** Anything else penalises her for
   leaving the house, which is the opposite of the intent.
-- **A docked device is never blocked.** That is what keeps a reason to put it back once
-  the balance is gone — and the negative floor is what keeps that reason alive past zero.
+- **A device at the reader is never blocked.** That is what keeps a reason to put it
+  back once the balance is gone — and the negative floor is what keeps that reason alive past zero.
 - **Grace is retroactive.** Cross the threshold and the *whole* pickup is charged, which
   is what stops short pickups being farmed into free time.
 - **`prefill_secs`** seeds a fresh ledger so day one is not spent staring at an empty bank.
-- **Fails closed**: a fresh ledger assumes every device is docked and *absent*, so
+- **Fails closed**: a fresh ledger assumes every device is at the reader and away from
+  home, so
   neither a dead NFC reader nor an unreachable FRITZ!Box can drain the balance.
 - **Time jumps over 5 minutes are neither charged nor credited** — a crash or an NTP
   correction must not move the balance.

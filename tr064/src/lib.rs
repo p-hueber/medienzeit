@@ -7,7 +7,7 @@
 //!
 //! TR-064 speaks plain HTTP on port 49000, so none of this needs TLS.
 //!
-//! # Talking to a box
+//! # Talking to a FRITZ!Box
 //!
 //! 1. POST the envelope from e.g. [`hosts::get_specific_host_entry`] to the action's
 //!    `control_url`, with `SOAPAction` set from [`soap::Action::soap_action`].
@@ -17,7 +17,7 @@
 //!    [`digest::Challenge::authorization`].
 //! 4. Parse the body with the matching `parse_*` function.
 //!
-//! # Prerequisites on the box
+//! # Prerequisites on the FRITZ!Box
 //!
 //! *Heimnetz → Netzwerk → Netzwerkeinstellungen → Zugriff für Anwendungen zulassen*
 //! must be on, and the user needs box-settings permission. Both devices want static

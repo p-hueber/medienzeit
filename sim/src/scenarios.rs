@@ -54,7 +54,7 @@ pub fn all() -> Vec<Scenario> {
     vec![
         scenario(
             "01-docked-filling",
-            "Docked at home, balance charging up",
+            "Put back at home, balance charging up",
             40 * 60,
             berlin(2026, 8, 3, 16, 0),
             600,
@@ -101,7 +101,7 @@ pub fn all() -> Vec<Scenario> {
         // nothing is billed at all and the balance never moves.
         scenario(
             "06-exhausted",
-            "Balance exactly gone, still out of the box: inverted, blocked",
+            "Balance exactly gone, still not put back: inverted, blocked",
             5 * 60,
             berlin(2026, 8, 3, 18, 30),
             5 * 60,
@@ -110,7 +110,7 @@ pub fn all() -> Vec<Scenario> {
         ),
         scenario(
             "07-in-debt",
-            "Overspent into the red, still undocked",
+            "Overspent into the red, still not put back",
             60,
             berlin(2026, 8, 3, 19, 0),
             10 * 60,
@@ -119,7 +119,7 @@ pub fn all() -> Vec<Scenario> {
         ),
         scenario(
             "08-night-docked",
-            "Night, everything in the box, charging through to morning",
+            "Night, everything put back, charging through to morning",
             45 * 60,
             berlin(2026, 8, 3, 22, 0),
             30 * 60,
