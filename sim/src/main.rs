@@ -63,11 +63,12 @@ fn print_help() {
            cargo run -p medienzeit-sim -- --shots DIR  write one PNG per screen state\n\n\
          KEYS (interactive)\n  \
            1 / 2     dock or undock device 1 / 2\n  \
+           3 / 4     toggle device 1 / 2 on the home network (out of the house)\n  \
            space     pause the simulated clock\n  \
            up/down   double or halve the clock speed\n  \
            b         grant 10 bonus minutes\n  \
-           n         jump to 04:00 tomorrow (day reset)\n  \
-           a         jump to Monday 09:00 (inside the away window)\n  \
+           n         jump forward one hour\n  \
+           a         jump to 22:30 (inside the night window)\n  \
            s         save a screenshot\n  \
            q / esc   quit\n"
     );
@@ -111,15 +112,16 @@ fn run_window(
         SimulatorDisplay::new(Size::new(WIDTH, HEIGHT));
     let mut window = Window::new("Medienzeit", &settings);
 
-    let mut ledger = Ledger::<2>::new();
-    // Monday 16:00: just after school, full weekday budget, nothing spent.
+    let mut ledger = Ledger::<2>::new(&policy);
+    // Monday 16:00: just home from school, prefilled balance, everything docked.
     let mut sim_now = berlin(2026, 8, 3, 16, 0);
     let mut speed = DEFAULT_SPEED;
     let mut paused = false;
     let mut docked = [true, true];
+    let mut present = [true, true];
     let mut shot_index = 0usize;
 
-    let (mut snapshot, _) = ledger.tick(sim_now, docked, &policy);
+    let (mut snapshot, _) = ledger.tick(sim_now, docked, present, &policy);
 
     // Prime the window before the loop: `Window::events()` panics if called before the
     // first `update()`, because the SDL window is created lazily on that first call.
@@ -146,6 +148,12 @@ fn run_window(
                     } else if keycode == Keycode::Num2 {
                         docked[1] = !docked[1];
                         println!("device 2 {}", if docked[1] { "docked" } else { "UNDOCKED" });
+                    } else if keycode == Keycode::Num3 {
+                        present[0] = !present[0];
+                        println!("device 1 {}", if present[0] { "at home" } else { "OUT" });
+                    } else if keycode == Keycode::Num4 {
+                        present[1] = !present[1];
+                        println!("device 2 {}", if present[1] { "at home" } else { "OUT" });
                     } else if keycode == Keycode::Space {
                         paused = !paused;
                         println!("clock {}", if paused { "paused" } else { "running" });
@@ -156,14 +164,12 @@ fn run_window(
                         speed = (speed / 2.0).max(1.0);
                         println!("speed {speed}x");
                     } else if keycode == Keycode::B {
-                        ledger.grant_bonus(10 * 60);
+                        ledger.grant_bonus(10 * 60, &policy);
                         println!("granted 10 bonus minutes");
                     } else if keycode == Keycode::N {
-                        // Next day at 04:00 local — exercises the reset path.
-                        let l = medienzeit_core::civil::local(sim_now);
-                        jump_to = Some(berlin(l.year, l.month, l.day, 4, 0) + 86_400);
+                        jump_to = Some(sim_now + 3_600);
                     } else if keycode == Keycode::A {
-                        jump_to = Some(berlin(2026, 8, 3, 9, 0));
+                        jump_to = Some(berlin(2026, 8, 3, 22, 30));
                     } else if keycode == Keycode::S {
                         let path = format!("medienzeit-{shot_index:02}.png");
                         display.to_rgb_output_image(&settings).save_png(&path)?;
@@ -177,7 +183,7 @@ fn run_window(
 
         if let Some(target) = jump_to {
             sim_now = target;
-            let (s, events) = ledger.tick(sim_now, docked, &policy);
+            let (s, events) = ledger.tick(sim_now, docked, present, &policy);
             report(&events);
             snapshot = s;
         } else {
@@ -186,12 +192,12 @@ fn run_window(
             // same way the 1 Hz firmware loop would account it.
             while sim_now < target {
                 sim_now = (sim_now + MAX_LEDGER_STEP).min(target);
-                let (s, events) = ledger.tick(sim_now, docked, &policy);
+                let (s, events) = ledger.tick(sim_now, docked, present, &policy);
                 report(&events);
                 snapshot = s;
             }
             if paused {
-                let (s, events) = ledger.tick(sim_now, docked, &policy);
+                let (s, events) = ledger.tick(sim_now, docked, present, &policy);
                 report(&events);
                 snapshot = s;
             }
@@ -215,10 +221,14 @@ fn run_window(
 fn report(events: &medienzeit_core::Events) {
     for e in events {
         match e {
-            Event::DayReset => println!("  [event] day reset — budget restored"),
-            Event::Exhausted => println!("  [event] EXHAUSTED — block both devices"),
-            Event::Restored => println!("  [event] restored — unblock both devices"),
+            Event::Exhausted => println!("  [event] EXHAUSTED — block undocked devices"),
+            Event::Restored => println!("  [event] restored — unblock"),
             Event::Warning => println!("  [event] 5 minutes left — chime"),
+            Event::NightBegan => println!("  [event] night began — lock out"),
+            Event::NightEnded => println!("  [event] night ended — unlock"),
+            Event::UndockedAtNight { device } => {
+                println!("  [event] device {device} TAKEN OUT AT NIGHT — alert")
+            }
             Event::TimeJump { gap_secs } => {
                 println!("  [event] time jump of {gap_secs}s ignored")
             }
@@ -249,8 +259,8 @@ mod tests {
         // Startup state: Monday 16:00, both devices on their cradles, full weekday
         // budget, clock deliberately still.
         assert_eq!(snapshot.docked, [true, true]);
-        assert!(!snapshot.spending);
-        assert!(!snapshot.exhausted);
-        assert_eq!(snapshot.allowance_secs, 60 * 60);
+        assert_eq!(snapshot.flow, medienzeit_core::Flow::Filling);
+        assert!(!snapshot.exhausted());
+        assert!(!snapshot.any_blocked());
     }
 }

@@ -25,7 +25,7 @@ embassy) land in M2 and M3.
 ## Running
 
 ```sh
-cargo test                       # 61 tests, all host-side
+cargo test                       # 65 tests, all host-side
 cargo run -p medienzeit-sim      # interactive virtual display (needs SDL2)
 cargo run -p medienzeit-sim -- --shots shots/   # one PNG per screen state
 ```
@@ -49,36 +49,51 @@ Simulator keys:
 | | |
 |---|---|
 | `1` / `2` | dock or undock device 1 / 2 |
+| `3` / `4` | toggle device 1 / 2 on the home network (simulate leaving the house) |
 | `space` | pause the simulated clock |
 | `up` / `down` | double or halve clock speed (starts at 60x — one budget-minute per second) |
 | `b` | grant 10 bonus minutes |
-| `n` | jump to 04:00 tomorrow (day reset) |
-| `a` | jump to Monday 09:00 (inside the away window) |
+| `n` | jump forward one hour |
+| `a` | jump to 22:30 (inside the night window) |
 | `s` | save a screenshot |
 | `q` | quit |
 
-Ledger events (`Exhausted`, `Restored`, `Warning`, `DayReset`, `TimeJump`) print to the
-console as they fire. In the firmware these become TR-064 calls, ntfy pushes and a
+Ledger events (`Exhausted`, `Restored`, `Warning`, `NightBegan`, `NightEnded`,
+`UndockedAtNight`, `TimeJump`) print to the console as they fire. In the firmware these become TR-064 calls, ntfy pushes and a
 chime; watching them here is how you check the edges fire exactly once.
 
 ## The rules, as implemented
 
-- **Wall-clock, not device-minutes.** The pool drains at 1x whenever *any* device is
-  undocked. Both out still costs 1x. See `Ledger::any_undocked`.
-- **A 3-minute grace period** on every pickup, so grabbing a phone to skip a track,
-  start a podcast or answer a message costs nothing. Billing is **retroactive**: cross
-  the threshold and the *whole* pickup is charged, which is what stops short pickups
-  being farmed into free time. Set `Policy::grace_secs` to 0 to disable.
-- **Day resets at 04:00 local**, not midnight, so a late evening does not get a fresh
-  allowance at the stroke of twelve. No carryover.
-- **Weekday and weekend allowances** (default 60 and 120 minutes). The day that began
-  Friday 04:00 keeps the weekday allowance through Friday night.
-- **Away windows** (default Mon–Fri 07:30–15:00) suppress the clock entirely, so the
-  school day does not drain the budget.
-- **Fails closed on the clock**: a fresh `Ledger` assumes both devices are *docked*, so
-  an NFC reader that never comes up cannot silently burn the whole day.
-- **Time jumps over 5 minutes are not charged** — a crash or an NTP correction must not
-  bill the budget.
+A single **balance**, in seconds. There is no daily allowance and no reset — the bucket
+is the whole model.
+
+| Situation | Balance | Internet |
+|---|---|---|
+| Docked at home | fills | on |
+| In use at home | drains 1× | on |
+| Brief pickup, under `grace_secs` | held | on |
+| …that pickup runs long | drains, **billed from the pickup** | on |
+| Out of the house (off the home network) | fills | on |
+| Night, docked | fills | on |
+| Night, undocked | held | **blocked** + alert |
+| Balance at zero, undocked | drains toward the floor | **blocked** |
+| Balance below zero, docked | fills back out of the hole | on |
+
+- **Refill is a ratio, not a rate.** The default 1:10 means "ten minutes not using earns
+  one minute of screen time", so a 21:00–07:00 night in the box funds an hour. A ratio
+  explains to a child; a rate does not. Kept rational so the accounting is integer-exact.
+- **Wall clock, not device-minutes.** Any device out drains at 1×. Both out still 1×.
+- **Being out earns exactly what being docked earns.** Anything else penalises her for
+  leaving the house, which is the opposite of the intent.
+- **A docked device is never blocked.** That is what keeps a reason to put it back once
+  the balance is gone — and the negative floor is what keeps that reason alive past zero.
+- **Grace is retroactive.** Cross the threshold and the *whole* pickup is charged, which
+  is what stops short pickups being farmed into free time.
+- **`prefill_secs`** seeds a fresh ledger so day one is not spent staring at an empty bank.
+- **Fails closed**: a fresh ledger assumes every device is docked and *absent*, so
+  neither a dead NFC reader nor an unreachable FRITZ!Box can drain the balance.
+- **Time jumps over 5 minutes are neither charged nor credited** — a crash or an NTP
+  correction must not move the balance.
 
 ## Known limits
 

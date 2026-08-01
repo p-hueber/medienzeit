@@ -13,10 +13,11 @@ use embedded_graphics::{
     prelude::*,
     primitives::{
         Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle, StrokeAlignment,
+        Triangle,
     },
 };
 use heapless::String;
-use medienzeit_core::{Snapshot, WARNING_SECS};
+use medienzeit_core::{Flow, Snapshot, WARNING_SECS};
 use u8g2_fonts::{
     fonts,
     types::{FontColor, HorizontalAlignment, VerticalPosition},
@@ -27,8 +28,8 @@ use u8g2_fonts::{
 pub const WIDTH: u32 = 200;
 pub const HEIGHT: u32 = 200;
 
-/// `BinaryColor::On` is ink. On the EPD that maps to `Color::Black`; the simulator
-/// is configured to match, so "On == dark" holds everywhere.
+/// `BinaryColor::On` is ink. On the EPD that maps to `Color::Black`; the simulator is
+/// configured to match, so "On == dark" holds everywhere.
 const INK: BinaryColor = BinaryColor::On;
 const PAPER: BinaryColor = BinaryColor::Off;
 
@@ -45,6 +46,8 @@ impl Default for Chrome<'_> {
     }
 }
 
+/// Numbers and colon only, which is why anything with a minus sign or a letter uses
+/// [`title_font`] instead.
 fn hero_font() -> FontRenderer {
     FontRenderer::new::<fonts::u8g2_font_logisoso62_tn>()
 }
@@ -58,9 +61,12 @@ fn small_font() -> FontRenderer {
     FontRenderer::new::<fonts::u8g2_font_helvR08_tr>()
 }
 
-/// Minutes remaining, rounded *up*, so "1 Minute" shows until the time is truly gone.
-fn minutes_ceil(secs: u32) -> u32 {
-    secs.div_ceil(60)
+/// Minutes, rounded *up*, so "1" shows until the time is truly gone.
+fn minutes_ceil(secs: i32) -> u32 {
+    if secs <= 0 {
+        return 0;
+    }
+    (secs as u32).div_ceil(60)
 }
 
 /// Draw the whole screen. Callers present/refresh afterwards.
@@ -72,15 +78,23 @@ pub fn render<D>(
 where
     D: DrawTarget<Color = BinaryColor>,
 {
-    // When the budget is gone the whole screen inverts. It is unmissable from across
-    // the room, which is the entire point of putting a display on this thing.
-    let (bg, fg) = if snap.exhausted { (INK, PAPER) } else { (PAPER, INK) };
+    // Locked out inverts the whole screen. It is unmissable from across the room,
+    // which is the entire point of putting a display on this thing.
+    let locked = snap.night || snap.exhausted();
+    let (bg, fg) = if locked { (INK, PAPER) } else { (PAPER, INK) };
 
     target.clear(bg)?;
     header(target, snap, fg)?;
-    hero(target, snap, fg)?;
-    progress(target, snap, fg)?;
+
+    if locked {
+        lockout(target, snap, fg)?;
+    } else {
+        hero(target, snap, fg)?;
+        gauge(target, snap, fg)?;
+    }
+
     dock_row(target, snap, chrome, fg)?;
+    flow_cue(target, snap, fg)?;
     Ok(())
 }
 
@@ -119,33 +133,62 @@ where
         .draw(target)
 }
 
+/// Night, or out of balance. Says what is happening and what to do about it.
+fn lockout<D>(target: &mut D, snap: &Snapshot<2>, fg: BinaryColor) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let cx = WIDTH as i32 / 2;
+    let title = if snap.night { "NACHT" } else { "ZEIT UM" };
+
+    let _ = title_font().render_aligned(
+        title,
+        Point::new(cx, 70),
+        VerticalPosition::Center,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(fg),
+        target,
+    );
+
+    // The actionable line matters more than the status one: docking is the only thing
+    // that changes the situation, so say so.
+    let mut sub: String<32> = String::new();
+    if snap.balance_secs < 0 {
+        let _ = write!(sub, "Minus {} Min", minutes_ceil(-snap.balance_secs));
+    } else if snap.docked.iter().all(|d| *d) {
+        let _ = sub.push_str("laedt wieder auf");
+    } else {
+        let _ = sub.push_str("in die Box legen");
+    }
+    let _ = label_font().render_aligned(
+        sub.as_str(),
+        Point::new(cx, 102),
+        VerticalPosition::Center,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(fg),
+        target,
+    );
+
+    if snap.balance_secs < 0 && !snap.docked.iter().all(|d| *d) {
+        let _ = small_font().render_aligned(
+            "in die Box legen",
+            Point::new(cx, 124),
+            VerticalPosition::Center,
+            HorizontalAlignment::Center,
+            FontColor::Transparent(fg),
+            target,
+        );
+    }
+    Ok(())
+}
+
 fn hero<D>(target: &mut D, snap: &Snapshot<2>, fg: BinaryColor) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = BinaryColor>,
 {
     let cx = WIDTH as i32 / 2;
+    let mins = minutes_ceil(snap.balance_secs);
 
-    if snap.exhausted {
-        let _ = title_font().render_aligned(
-            "ZEIT UM",
-            Point::new(cx, 74),
-            VerticalPosition::Center,
-            HorizontalAlignment::Center,
-            FontColor::Transparent(fg),
-            target,
-        );
-        let _ = label_font().render_aligned(
-            "Morgen wieder",
-            Point::new(cx, 106),
-            VerticalPosition::Center,
-            HorizontalAlignment::Center,
-            FontColor::Transparent(fg),
-            target,
-        );
-        return Ok(());
-    }
-
-    let mins = minutes_ceil(snap.remaining_secs);
     let mut big: String<8> = String::new();
     if mins >= 60 {
         let _ = write!(big, "{}:{:02}", mins / 60, mins % 60);
@@ -171,11 +214,11 @@ where
         FontColor::Transparent(fg),
         target,
     );
-
     Ok(())
 }
 
-fn progress<D>(target: &mut D, snap: &Snapshot<2>, fg: BinaryColor) -> Result<(), D::Error>
+/// Balance against the cap, so saving toward something is visible.
+fn gauge<D>(target: &mut D, snap: &Snapshot<2>, fg: BinaryColor) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = BinaryColor>,
 {
@@ -183,13 +226,6 @@ where
         Rectangle::new(Point::new(6, 138), Size::new(WIDTH - 12, 16)),
         Size::new(3, 3),
     );
-
-    // Inverted screen, full bar: draw it solid. A 1 px gap between a white outline and
-    // a white fill reads as an *empty* bar on black, which is exactly backwards.
-    if snap.exhausted {
-        return outline.into_styled(PrimitiveStyle::with_fill(fg)).draw(target);
-    }
-
     outline
         .into_styled(
             PrimitiveStyleBuilder::new()
@@ -200,31 +236,16 @@ where
         )
         .draw(target)?;
 
-    // An away-window shows an empty bar with a caption rather than a fill, so
-    // "paused" never looks like "you have used none of it".
-    if snap.away {
-        let _ = small_font().render_aligned(
-            "PAUSE - zaehlt nicht",
-            Point::new(WIDTH as i32 / 2, 146),
-            VerticalPosition::Center,
-            HorizontalAlignment::Center,
-            FontColor::Transparent(fg),
-            target,
-        );
-        return Ok(());
-    }
-
-    if snap.allowance_secs > 0 {
+    if snap.cap_secs > 0 && snap.balance_secs > 0 {
         let inner_w = WIDTH - 16;
-        let frac = snap.spent_secs.min(snap.allowance_secs) as u64 * inner_w as u64
-            / snap.allowance_secs as u64;
-        if frac > 0 {
-            Rectangle::new(Point::new(8, 140), Size::new(frac as u32, 12))
+        let filled = (snap.balance_secs as u64).min(snap.cap_secs as u64) * inner_w as u64
+            / snap.cap_secs as u64;
+        if filled > 0 {
+            Rectangle::new(Point::new(8, 140), Size::new(filled as u32, 12))
                 .into_styled(PrimitiveStyle::with_fill(fg))
                 .draw(target)?;
         }
     }
-
     Ok(())
 }
 
@@ -241,7 +262,7 @@ where
     for (i, name) in chrome.device_names.iter().enumerate() {
         let x = 8 + i as i32 * half;
 
-        // Filled square = on the cradle, hollow = in her hands.
+        // Filled square = on the cradle, hollow = out of the box.
         let box_rect = Rectangle::new(Point::new(x, 168), Size::new(12, 12));
         if snap.docked[i] {
             box_rect.into_styled(PrimitiveStyle::with_fill(fg)).draw(target)?;
@@ -258,14 +279,32 @@ where
             target,
         );
     }
+    Ok(())
+}
 
-    // The rule along the bottom is the clock-state cue, on a display that cannot
-    // animate: dashed = picked up but still free, solid = billing, thick = last
-    // minutes. Deliberately wordless — no text to translate, no umlauts to render.
-    if !snap.exhausted {
-        let y = 192;
-        let right = WIDTH as i32 - 7;
-        if snap.in_grace {
+/// The bottom of the screen says what the balance is doing, wordlessly — no text to
+/// translate and no umlauts to render.
+///
+/// - upward triangle: filling
+/// - dashed rule: held (inside grace, or undocked at night)
+/// - solid rule: draining, thick in the last minutes
+fn flow_cue<D>(target: &mut D, snap: &Snapshot<2>, fg: BinaryColor) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let y = 192;
+    let right = WIDTH as i32 - 7;
+    let cx = WIDTH as i32 / 2;
+
+    match snap.flow {
+        Flow::Filling => Triangle::new(
+            Point::new(cx, y - 7),
+            Point::new(cx - 7, y),
+            Point::new(cx + 7, y),
+        )
+        .into_styled(PrimitiveStyle::with_fill(fg))
+        .draw(target),
+        Flow::Held => {
             let style = PrimitiveStyle::with_stroke(fg, 1);
             let mut x = 6;
             while x < right {
@@ -275,15 +314,15 @@ where
                     .draw(target)?;
                 x += 12;
             }
-        } else if snap.spending {
-            let warn = snap.remaining_secs <= WARNING_SECS;
+            Ok(())
+        }
+        Flow::Draining => {
+            let warn = snap.balance_secs <= WARNING_SECS;
             Line::new(Point::new(6, y), Point::new(right, y))
                 .into_styled(PrimitiveStyle::with_stroke(fg, if warn { 3 } else { 1 }))
-                .draw(target)?;
+                .draw(target)
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -298,5 +337,13 @@ mod tests {
         assert_eq!(minutes_ceil(60), 1);
         assert_eq!(minutes_ceil(61), 2);
         assert_eq!(minutes_ceil(3_600), 60);
+    }
+
+    #[test]
+    fn a_negative_balance_reads_as_zero_minutes_remaining() {
+        // The magnitude is shown separately on the lockout screen; the hero never
+        // needs a minus sign, which the numbers-only hero font could not render.
+        assert_eq!(minutes_ceil(-1), 0);
+        assert_eq!(minutes_ceil(-1_800), 0);
     }
 }

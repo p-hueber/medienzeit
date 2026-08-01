@@ -11,8 +11,8 @@ pub mod policy;
 pub mod state;
 
 pub use civil::LocalDateTime;
-pub use policy::{AwayWindow, Policy};
-pub use state::{Event, Events, Ledger, Snapshot, WARNING_SECS};
+pub use policy::{Policy, Window};
+pub use state::{Event, Events, Flow, Ledger, Snapshot, WARNING_SECS};
 
 /// Number of cradles in the first build.
 pub const DEVICES: usize = 2;

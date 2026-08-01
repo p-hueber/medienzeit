@@ -1,8 +1,10 @@
 //! Canonical screen states, used both for `--shots` and as a quick visual regression
 //! set. Each one is produced by actually running the ledger, never by hand-building a
 //! `Snapshot` — otherwise the pictures could show states the real logic cannot reach.
+//!
+//! The list mirrors the scenario table in the plan, row for row.
 
-use medienzeit_core::{AwayWindow, Ledger, Policy, Snapshot};
+use medienzeit_core::{Ledger, Policy, Snapshot};
 
 use crate::clock::berlin;
 
@@ -15,115 +17,132 @@ pub struct Scenario {
 const DOCKED: [bool; 2] = [true, true];
 const ONE_OUT: [bool; 2] = [false, true];
 const BOTH_OUT: [bool; 2] = [false, false];
+const HOME: [bool; 2] = [true, true];
+const AWAY: [bool; 2] = [false, false];
 
-/// Advance a ledger second-by-second, which is what the firmware does at 1 Hz.
-fn run(l: &mut Ledger<2>, p: &Policy, start: i64, secs: i64, docked: [bool; 2]) -> Snapshot<2> {
-    let mut last = l.tick(start, docked, p).0;
+/// Advance a ledger second by second, which is what the firmware does at 1 Hz.
+fn run(
+    l: &mut Ledger<2>,
+    p: &Policy,
+    start: i64,
+    secs: i64,
+    docked: [bool; 2],
+    present: [bool; 2],
+) -> Snapshot<2> {
+    let mut last = l.tick(start, docked, present, p).0;
     for t in 1..=secs {
-        last = l.tick(start + t, docked, p).0;
+        last = l.tick(start + t, docked, present, p).0;
     }
     last
 }
 
-pub fn all() -> Vec<Scenario> {
+fn scenario(
+    name: &'static str,
+    description: &'static str,
+    balance: i32,
+    start: i64,
+    secs: i64,
+    docked: [bool; 2],
+    present: [bool; 2],
+) -> Scenario {
     let p = Policy::default();
-    let mut out = Vec::new();
+    let mut l = Ledger::<2>::with_balance(balance);
+    Scenario { name, description, snapshot: run(&mut l, &p, start, secs, docked, present) }
+}
 
-    // Monday 16:00, nothing used yet, both devices on their cradles.
-    {
-        let mut l = Ledger::<2>::new();
-        let snap = run(&mut l, &p, berlin(2026, 8, 3, 16, 0), 2, DOCKED);
-        out.push(Scenario {
-            name: "01-fresh-docked",
-            description: "Monday 16:00, full weekday budget, both docked",
-            snapshot: snap,
-        });
-    }
-
-    // 25 minutes in, one device in her hands.
-    {
-        let mut l = Ledger::<2>::new();
-        let snap = run(&mut l, &p, berlin(2026, 8, 3, 16, 0), 25 * 60, ONE_OUT);
-        out.push(Scenario {
-            name: "02-spending",
-            description: "25 min used, phone undocked, clock running",
-            snapshot: snap,
-        });
-    }
-
-    // Over an hour of weekend budget used.
-    {
-        let mut l = Ledger::<2>::new();
-        let snap = run(&mut l, &p, berlin(2026, 8, 1, 14, 0), 35 * 60, BOTH_OUT);
-        out.push(Scenario {
-            name: "03-weekend-hours",
-            description: "Saturday, 2 h allowance, both devices out, H:MM layout",
-            snapshot: snap,
-        });
-    }
-
-    // Inside the school away-window with both devices out — must not drain.
-    {
-        let mut l = Ledger::<2>::new();
-        let snap = run(&mut l, &p, berlin(2026, 8, 3, 9, 0), 30 * 60, BOTH_OUT);
-        out.push(Scenario {
-            name: "04-away-window",
-            description: "Monday 09:30 at school, undocked but paused",
-            snapshot: snap,
-        });
-    }
-
-    // Four minutes left: warning styling.
-    {
-        let mut p_short = p.clone();
-        p_short.weekday_secs = 30 * 60;
-        let mut l = Ledger::<2>::new();
-        let snap = run(&mut l, &p_short, berlin(2026, 8, 3, 17, 0), 26 * 60, ONE_OUT);
-        out.push(Scenario {
-            name: "05-warning",
-            description: "4 min left, thick rule, last-minutes warning",
-            snapshot: snap,
-        });
-    }
-
-    // Budget gone.
-    {
-        let mut p_short = p.clone();
-        p_short.weekday_secs = 10 * 60;
-        let mut l = Ledger::<2>::new();
-        let snap = run(&mut l, &p_short, berlin(2026, 8, 3, 17, 0), 11 * 60, ONE_OUT);
-        out.push(Scenario {
-            name: "06-exhausted",
-            description: "Budget spent, screen inverted, devices blocked",
-            snapshot: snap,
-        });
-    }
-
-    // Exactly one minute left — checks the round-up so it never shows 0 too early.
-    {
-        let mut p_short = p.clone();
-        p_short.weekday_secs = 10 * 60;
-        p_short.away.clear();
-        let _ = p_short.away.push(AwayWindow::hm(AwayWindow::WEEKDAYS, 7, 30, 15, 0));
-        let mut l = Ledger::<2>::new();
-        let snap = run(&mut l, &p_short, berlin(2026, 8, 3, 17, 0), 9 * 60 + 30, ONE_OUT);
-        out.push(Scenario {
-            name: "07-last-minute",
-            description: "30 s left, still reads 1 (round up)",
-            snapshot: snap,
-        });
-    }
-
-    // Picked up 90 s ago to start a podcast — inside grace, nothing billed yet.
-    {
-        let mut l = Ledger::<2>::new();
-        let snap = run(&mut l, &p, berlin(2026, 8, 3, 16, 40), 90, ONE_OUT);
-        out.push(Scenario {
-            name: "08-grace",
-            description: "Brief pickup inside the grace period: dashed rule, budget untouched",
-            snapshot: snap,
-        });
-    }
-
-    out
+pub fn all() -> Vec<Scenario> {
+    vec![
+        scenario(
+            "01-docked-filling",
+            "Docked at home, balance charging up",
+            40 * 60,
+            berlin(2026, 8, 3, 16, 0),
+            600,
+            DOCKED,
+            HOME,
+        ),
+        scenario(
+            "02-draining",
+            "In use at home, clock running",
+            75 * 60,
+            berlin(2026, 8, 3, 16, 30),
+            15 * 60,
+            ONE_OUT,
+            HOME,
+        ),
+        scenario(
+            "03-grace",
+            "Brief pickup inside grace: dashed rule, balance untouched",
+            50 * 60,
+            berlin(2026, 8, 3, 17, 0),
+            90,
+            ONE_OUT,
+            HOME,
+        ),
+        scenario(
+            "04-out-and-about",
+            "Out of the house: undocked but off-network, so it still fills",
+            30 * 60,
+            berlin(2026, 8, 3, 14, 0),
+            30 * 60,
+            BOTH_OUT,
+            AWAY,
+        ),
+        scenario(
+            "05-warning",
+            "Four minutes left, thick rule",
+            9 * 60,
+            berlin(2026, 8, 3, 18, 0),
+            5 * 60,
+            ONE_OUT,
+            HOME,
+        ),
+        // Exactly zero, not negative — the run must exceed the grace period or
+        // nothing is billed at all and the balance never moves.
+        scenario(
+            "06-exhausted",
+            "Balance exactly gone, still out of the box: inverted, blocked",
+            5 * 60,
+            berlin(2026, 8, 3, 18, 30),
+            5 * 60,
+            ONE_OUT,
+            HOME,
+        ),
+        scenario(
+            "07-in-debt",
+            "Overspent into the red, still undocked",
+            60,
+            berlin(2026, 8, 3, 19, 0),
+            10 * 60,
+            ONE_OUT,
+            HOME,
+        ),
+        scenario(
+            "08-night-docked",
+            "Night, everything in the box, charging through to morning",
+            45 * 60,
+            berlin(2026, 8, 3, 22, 0),
+            30 * 60,
+            DOCKED,
+            HOME,
+        ),
+        scenario(
+            "09-night-undocked",
+            "Taken out during the night: locked out and alerted",
+            45 * 60,
+            berlin(2026, 8, 3, 23, 0),
+            5 * 60,
+            ONE_OUT,
+            HOME,
+        ),
+        scenario(
+            "10-near-cap",
+            "Saved up close to the cap",
+            170 * 60,
+            berlin(2026, 8, 1, 11, 0),
+            20 * 60,
+            DOCKED,
+            HOME,
+        ),
+    ]
 }
