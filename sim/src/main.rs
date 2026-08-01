@@ -90,7 +90,18 @@ fn write_shots(dir: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn interactive() -> Result<(), Box<dyn std::error::Error>> {
-    print_help();
+    run_window(None).map(|_| ())
+}
+
+/// The windowed loop. `max_frames` bounds it so a headless smoke test can drive the
+/// real SDL path — window creation, event polling, presentation — rather than only the
+/// drawing code. Returns the final snapshot so the test has something to assert on.
+fn run_window(
+    max_frames: Option<usize>,
+) -> Result<medienzeit_core::Snapshot<2>, Box<dyn std::error::Error>> {
+    if max_frames.is_none() {
+        print_help();
+    }
 
     let policy = Policy::default();
     let chrome = Chrome::default();
@@ -116,6 +127,7 @@ fn interactive() -> Result<(), Box<dyn std::error::Error>> {
     window.update(&display);
 
     let mut last_frame = Instant::now();
+    let mut frames = 0usize;
 
     'running: loop {
         let elapsed = last_frame.elapsed().as_secs_f64();
@@ -188,10 +200,14 @@ fn interactive() -> Result<(), Box<dyn std::error::Error>> {
         medienzeit_ui::render(&mut display, &snapshot, &chrome)?;
         window.update(&display);
 
+        frames += 1;
+        if max_frames.is_some_and(|m| frames >= m) {
+            break 'running;
+        }
         std::thread::sleep(Duration::from_millis(40));
     }
 
-    Ok(())
+    Ok(snapshot)
 }
 
 /// The firmware turns these into TR-064 calls, ntfy pushes and a chime. Here we just
@@ -207,5 +223,34 @@ fn report(events: &medienzeit_core::Events) {
                 println!("  [event] time jump of {gap_secs}s ignored")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Boot the real windowed loop under SDL's dummy video driver.
+    ///
+    /// This exists because the `--shots` path constructs no `Window` at all: it
+    /// exercises every line of drawing code and none of the windowing, which is how a
+    /// panic in the very first frame once shipped. `Window::events()` is documented to
+    /// panic unless `update()` has been called at least once, so the ordering inside
+    /// the loop is load-bearing and deserves a test that would actually notice.
+    ///
+    /// The whole binary has exactly this one test, so setting the process-wide SDL
+    /// driver here cannot race another thread.
+    #[test]
+    fn windowed_loop_survives_its_first_frames_headless() {
+        std::env::set_var("SDL_VIDEODRIVER", "dummy");
+
+        let snapshot = run_window(Some(3)).expect("simulator should start headless");
+
+        // Startup state: Monday 16:00, both devices on their cradles, full weekday
+        // budget, clock deliberately still.
+        assert_eq!(snapshot.docked, [true, true]);
+        assert!(!snapshot.spending);
+        assert!(!snapshot.exhausted);
+        assert_eq!(snapshot.allowance_secs, 60 * 60);
     }
 }

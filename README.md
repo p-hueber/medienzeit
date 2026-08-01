@@ -25,7 +25,7 @@ embassy) land in M2 and M3.
 ## Running
 
 ```sh
-cargo test                       # 60 tests, all host-side
+cargo test                       # 61 tests, all host-side
 cargo run -p medienzeit-sim      # interactive virtual display (needs SDL2)
 cargo run -p medienzeit-sim -- --shots shots/   # one PNG per screen state
 ```
