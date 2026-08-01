@@ -1,0 +1,13 @@
+[package]
+name = "medienzeit-tr064"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A pure codec: builds TR-064 SOAP requests and parses the responses. It performs no
+# I/O at all, which is what lets the same code run on the ESP32 under `reqwless` and
+# in host tests against recorded XML.
+
+[dependencies]
+heapless.workspace = true
+md-5 = { version = "0.10", default-features = false }

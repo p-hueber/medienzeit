@@ -1,0 +1,13 @@
+[package]
+name = "medienzeit-tr064-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Host-side exerciser for the tr064 codec: talks to a real FRITZ!Box over plain HTTP
+# on port 49000 using nothing but std::net, so the codec gets validated against real
+# hardware long before any firmware exists.
+
+[dependencies]
+medienzeit-tr064.workspace = true
+heapless.workspace = true

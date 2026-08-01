@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:GetSpecificHostEntryResponse xmlns:u="urn:dslforum-org:service:Hosts:1">
+<NewIPAddress>192.168.178.42</NewIPAddress>
+<NewAddressSource>DHCP</NewAddressSource>
+<NewLeaseTimeRemaining>0</NewLeaseTimeRemaining>
+<NewInterfaceType>802.11</NewInterfaceType>
+<NewActive>1</NewActive>
+<NewHostName>Pixel-8</NewHostName>
+</u:GetSpecificHostEntryResponse>
+</s:Body>
+</s:Envelope>

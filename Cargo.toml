@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["core", "ui", "sim"]
+members = ["core", "ui", "sim", "tr064", "tr064-cli"]
 
-# `firmware/` and `tr064/` join later (M2/M4). The firmware needs its own target
+# `pn5180/` and `firmware/` join later. The firmware needs its own target
 # and linker config, so it will be excluded from this workspace when it lands.
 
 [workspace.package]
@@ -13,5 +13,6 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 medienzeit-core = { path = "core" }
 medienzeit-ui = { path = "ui" }
+medienzeit-tr064 = { path = "tr064" }
 embedded-graphics = "0.8"
 heapless = "0.8"

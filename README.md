@@ -16,17 +16,33 @@ Full design, hardware BOM and milestones: `~/.claude/plans/so-i-have-issues-melo
 | `core/` | `no_std`, no hardware. Civil-time/DST maths, the day boundary, the policy, the accounting ledger. All of it unit-tested on the host — this is where the subtle bugs would otherwise live. |
 | `ui/` | `no_std`. Draws the 200x200 screen against any `embedded-graphics` `DrawTarget`, so the simulator and the real SSD1681 panel run the same code. |
 | `sim/` | Host binary. A virtual display driving the **real** ledger and the **real** drawing code, with only the clock and the NFC readers faked. |
+| `tr064/` | `no_std`. FRITZ!Box SOAP codec: request building, HTTP digest auth, response parsing. Does **no I/O**, which is why the firmware and the CLI below share it byte for byte. |
+| `tr064-cli/` | Host binary, zero dependencies beyond `std::net`. Points the codec at a real FRITZ!Box so enforcement is proven before any firmware exists. |
 
-`pn5180/` (ISO 15693 reader driver, written from scratch), `firmware/` (ESP32-S3,
-embassy) and `tr064/` (Fritz!Box SOAP) land in M2, M3 and M5.
+`pn5180/` (ISO 15693 reader driver, written from scratch) and `firmware/` (ESP32-S3,
+embassy) land in M2 and M3.
 
 ## Running
 
 ```sh
-cargo test                       # 34 tests, all host-side
+cargo test                       # 60 tests, all host-side
 cargo run -p medienzeit-sim      # interactive virtual display (needs SDL2)
 cargo run -p medienzeit-sim -- --shots shots/   # one PNG per screen state
 ```
+
+Against a real FRITZ!Box (needs *Zugriff für Anwendungen zulassen* enabled, and a user
+with box-settings permission):
+
+```sh
+export FRITZBOX_USER=medienzeit FRITZBOX_PASS=...
+cargo run -p medienzeit-tr064-cli -- host 3C:22:FB:11:22:33   # MAC -> IP + online
+cargo run -p medienzeit-tr064-cli -- block   192.168.178.42   # cut internet
+cargo run -p medienzeit-tr064-cli -- status  192.168.178.42
+cargo run -p medienzeit-tr064-cli -- unblock 192.168.178.42
+```
+
+`block` and `unblock` read the state back afterwards rather than trusting the
+acknowledgement, and fail loudly if the box did not actually apply the change.
 
 Simulator keys:
 
