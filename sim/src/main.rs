@@ -109,6 +109,12 @@ fn interactive() -> Result<(), Box<dyn std::error::Error>> {
     let mut shot_index = 0usize;
 
     let (mut snapshot, _) = ledger.tick(sim_now, docked, &policy);
+
+    // Prime the window before the loop: `Window::events()` panics if called before the
+    // first `update()`, because the SDL window is created lazily on that first call.
+    medienzeit_ui::render(&mut display, &snapshot, &chrome)?;
+    window.update(&display);
+
     let mut last_frame = Instant::now();
 
     'running: loop {
