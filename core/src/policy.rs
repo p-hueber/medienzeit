@@ -58,6 +58,13 @@ pub struct Policy {
     /// Local hour at which the budget resets. 04:00 rather than midnight, so a late
     /// evening does not get a fresh allowance at the stroke of twelve.
     pub reset_hour: u32,
+    /// How long a device may be off its cradle before the budget starts draining.
+    ///
+    /// Covers picking the phone up to skip a track, start a podcast or answer a
+    /// message. Crucially the charge is **retroactive**: cross this threshold and the
+    /// whole interval since undocking is billed, so short pickups cannot be farmed
+    /// into free time. Set to 0 to disable.
+    pub grace_secs: u32,
     pub away: Vec<AwayWindow, MAX_AWAY_WINDOWS>,
 }
 
@@ -69,6 +76,7 @@ impl Default for Policy {
             weekday_secs: 60 * 60,
             weekend_secs: 120 * 60,
             reset_hour: 4,
+            grace_secs: 3 * 60,
             away,
         }
     }

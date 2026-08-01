@@ -259,12 +259,28 @@ where
         );
     }
 
-    // A rule under a running clock: a cheap motion cue on a display that cannot animate.
-    if snap.spending && !snap.exhausted {
-        let warn = snap.remaining_secs <= WARNING_SECS;
-        Line::new(Point::new(6, 192), Point::new(WIDTH as i32 - 7, 192))
-            .into_styled(PrimitiveStyle::with_stroke(fg, if warn { 3 } else { 1 }))
-            .draw(target)?;
+    // The rule along the bottom is the clock-state cue, on a display that cannot
+    // animate: dashed = picked up but still free, solid = billing, thick = last
+    // minutes. Deliberately wordless — no text to translate, no umlauts to render.
+    if !snap.exhausted {
+        let y = 192;
+        let right = WIDTH as i32 - 7;
+        if snap.in_grace {
+            let style = PrimitiveStyle::with_stroke(fg, 1);
+            let mut x = 6;
+            while x < right {
+                let seg_end = (x + 6).min(right);
+                Line::new(Point::new(x, y), Point::new(seg_end, y))
+                    .into_styled(style)
+                    .draw(target)?;
+                x += 12;
+            }
+        } else if snap.spending {
+            let warn = snap.remaining_secs <= WARNING_SECS;
+            Line::new(Point::new(6, y), Point::new(right, y))
+                .into_styled(PrimitiveStyle::with_stroke(fg, if warn { 3 } else { 1 }))
+                .draw(target)?;
+        }
     }
 
     Ok(())

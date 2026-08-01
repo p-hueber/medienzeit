@@ -43,6 +43,11 @@ pub struct Snapshot<const N: usize> {
     pub away: bool,
     /// True when the budget is actually draining this instant.
     pub spending: bool,
+    /// True when a device is off its cradle but still inside the grace period, so
+    /// nothing is being billed *yet*.
+    pub in_grace: bool,
+    /// Seconds of grace left before the clock starts — and bills retroactively.
+    pub grace_remaining_secs: u32,
     pub exhausted: bool,
     pub local: LocalDateTime,
 }
@@ -51,9 +56,14 @@ pub struct Snapshot<const N: usize> {
 pub struct Ledger<const N: usize> {
     day: i64,
     spent_secs: u32,
+    /// Time accrued inside the current grace period. Flushed into `spent_secs` if the
+    /// grace expires, discarded if she puts the device back first.
+    pending_secs: u32,
     bonus_secs: u32,
     docked: [bool; N],
     last_tick: Option<i64>,
+    /// When the current run of "would be spending" began, for grace accounting.
+    spending_since: Option<i64>,
     was_exhausted: bool,
     warned: bool,
 }
@@ -69,11 +79,13 @@ impl<const N: usize> Ledger<N> {
         Self {
             day: i64::MIN,
             spent_secs: 0,
+            pending_secs: 0,
             bonus_secs: 0,
             // Assume docked until a reader says otherwise: fail *closed* on the
             // clock, so a reader that never comes up cannot silently burn the day.
             docked: [true; N],
             last_tick: None,
+            spending_since: None,
             was_exhausted: false,
             warned: false,
         }
@@ -97,6 +109,13 @@ impl<const N: usize> Ledger<N> {
         self.remaining_secs(policy) == 0
     }
 
+    /// Seconds of grace left in the current pickup, 0 if not in one.
+    pub fn grace_remaining_secs(&self, utc: i64, policy: &Policy) -> u32 {
+        let Some(started) = self.spending_since else { return 0 };
+        let elapsed = utc.saturating_sub(started).clamp(0, u32::MAX as i64) as u32;
+        policy.grace_secs.saturating_sub(elapsed)
+    }
+
     /// Grant extra time for today. Survives until the next day reset.
     pub fn grant_bonus(&mut self, secs: u32) {
         self.bonus_secs = self.bonus_secs.saturating_add(secs);
@@ -116,25 +135,53 @@ impl<const N: usize> Ledger<N> {
             // Resetting is the safe direction: it can hand back time, never steal it.
             self.day = day;
             self.spent_secs = 0;
+            self.pending_secs = 0;
             self.bonus_secs = 0;
             self.warned = false;
             self.last_tick = None;
+            self.spending_since = None;
             let _ = events.push(Event::DayReset);
         }
 
         self.docked = docked;
         let away = policy.is_away(&local);
-        let spending = self.any_undocked() && !away;
+        let running = self.any_undocked() && !away;
+
+        // Grace tracks an unbroken run of "would be spending". Redocking — or an away
+        // window starting — ends the run and forgives whatever had accrued.
+        if running {
+            if self.spending_since.is_none() {
+                self.spending_since = Some(utc);
+            }
+        } else {
+            self.spending_since = None;
+            self.pending_secs = 0;
+        }
+
+        let grace_left = self.grace_remaining_secs(utc, policy);
+        let in_grace = running && grace_left > 0;
 
         if let Some(last) = self.last_tick {
             let gap = utc - last;
             if gap > MAX_TICK_GAP_SECS {
                 let _ = events.push(Event::TimeJump { gap_secs: gap });
-            } else if gap > 0 && spending {
-                self.spent_secs = self.spent_secs.saturating_add(gap as u32);
+            } else if gap > 0 && running {
+                if in_grace {
+                    self.pending_secs = self.pending_secs.saturating_add(gap as u32);
+                } else {
+                    // Grace has lapsed: bill this tick *and* everything held back
+                    // during the grace period. Short pickups stay free; the moment
+                    // one turns into real use, the whole pickup is charged.
+                    self.spent_secs = self
+                        .spent_secs
+                        .saturating_add(self.pending_secs)
+                        .saturating_add(gap as u32);
+                    self.pending_secs = 0;
+                }
             }
         }
         self.last_tick = Some(utc);
+        let spending = running && !in_grace;
 
         let remaining = self.remaining_secs(policy);
         let exhausted = remaining == 0;
@@ -161,6 +208,8 @@ impl<const N: usize> Ledger<N> {
             docked: self.docked,
             away,
             spending,
+            in_grace,
+            grace_remaining_secs: grace_left,
             exhausted,
             local,
         };
@@ -179,10 +228,11 @@ mod tests {
         naive - civil::utc_offset(naive)
     }
 
-    /// A policy with no away-windows, so tests opt in to them explicitly.
+    /// A policy with no away-windows and no grace, so tests opt into both explicitly.
     fn plain_policy() -> Policy {
         let mut p = Policy::default();
         p.away.clear();
+        p.grace_secs = 0;
         p
     }
 
@@ -370,6 +420,122 @@ mod tests {
         // If a PN532 never initialises we must not burn the whole day silently.
         let l = Ledger::<2>::new();
         assert!(!l.any_undocked());
+    }
+
+    /// Grace policy: 3 minutes, no away-windows.
+    fn grace_policy() -> Policy {
+        let mut p = plain_policy();
+        p.grace_secs = 180;
+        p
+    }
+
+    #[test]
+    fn brief_pickup_within_grace_costs_nothing() {
+        let p = grace_policy();
+        let mut l = Ledger::<2>::new();
+        let start = berlin(2026, 8, 3, 17, 0);
+
+        // Picked up for 90 s to start a podcast, then put back.
+        let (t, snap) = run(&mut l, &p, start, 90, ONE_OUT);
+        assert_eq!(snap.spent_secs, 0, "nothing billed while inside grace");
+        assert!(snap.in_grace);
+        assert!(!snap.spending);
+        assert_eq!(snap.grace_remaining_secs, 90);
+
+        let (_, snap) = run(&mut l, &p, t, 5, DOCKED);
+        assert_eq!(snap.spent_secs, 0, "redocking in time forgives the pickup");
+        assert!(!snap.in_grace);
+    }
+
+    #[test]
+    fn overrunning_grace_bills_the_whole_pickup_retroactively() {
+        let p = grace_policy();
+        let mut l = Ledger::<2>::new();
+        // Out for 5 minutes: the 3 grace minutes are billed too, not just the excess.
+        let (_, snap) = run(&mut l, &p, berlin(2026, 8, 3, 17, 0), 300, ONE_OUT);
+        assert_eq!(snap.spent_secs, 300);
+        assert!(snap.spending);
+        assert!(!snap.in_grace);
+    }
+
+    #[test]
+    fn grace_cannot_be_farmed_into_free_time() {
+        // The exploit this guards against: undock, use for just under the grace
+        // period, redock for a second, repeat forever. Retroactive billing means the
+        // only way to stay free is to genuinely put the device back — but a *long*
+        // session broken into chunks must still cost close to its real length.
+        let p = grace_policy();
+        let mut l = Ledger::<2>::new();
+        let mut t = berlin(2026, 8, 3, 17, 0);
+
+        // Ten cycles of "out for 170 s, back for 2 s" — 28 minutes of wall time.
+        for _ in 0..10 {
+            let (next, _) = run(&mut l, &p, t, 170, ONE_OUT);
+            let (next, _) = run(&mut l, &p, next, 2, DOCKED);
+            t = next;
+        }
+        // Each cycle really is under the grace period, so it really is free. That is
+        // the intended deal: she is genuinely docking the device every three minutes.
+        assert_eq!(l.spent_secs, 0);
+
+        // But the moment one pickup runs long, the full pickup is billed — there is no
+        // per-pickup free allowance carried into it.
+        let (_, snap) = run(&mut l, &p, t, 600, ONE_OUT);
+        assert_eq!(snap.spent_secs, 600);
+    }
+
+    #[test]
+    fn grace_restarts_only_after_a_genuine_redock() {
+        let p = grace_policy();
+        let mut l = Ledger::<2>::new();
+        let start = berlin(2026, 8, 3, 17, 0);
+
+        // Out for 4 minutes: grace consumed, now billing.
+        let (t, snap) = run(&mut l, &p, start, 240, ONE_OUT);
+        assert_eq!(snap.spent_secs, 240);
+
+        // Docking the *other* device changes nothing — the first is still out.
+        let (t, snap) = run(&mut l, &p, t, 60, ONE_OUT);
+        assert_eq!(snap.spent_secs, 300, "no fresh grace without docking everything");
+        assert!(!snap.in_grace);
+
+        // Both docked, then picked up again: a new pickup, fresh grace.
+        let (t, _) = run(&mut l, &p, t, 5, DOCKED);
+        let (_, snap) = run(&mut l, &p, t, 60, ONE_OUT);
+        assert_eq!(snap.spent_secs, 300);
+        assert!(snap.in_grace);
+    }
+
+    #[test]
+    fn away_window_ending_mid_pickup_forgives_and_restarts_grace() {
+        let mut p = grace_policy();
+        let _ = p.away.push(AwayWindow::hm(AwayWindow::WEEKDAYS, 7, 30, 15, 0));
+        let mut l = Ledger::<2>::new();
+        // Undocked from 14:58, so the away window covers the first two minutes.
+        let (_, snap) = run(&mut l, &p, berlin(2026, 8, 3, 14, 58), 240, ONE_OUT);
+        // Grace starts at 15:00 when billing would otherwise begin, and 2 min later
+        // it has not yet lapsed.
+        assert!(snap.in_grace);
+        assert_eq!(snap.spent_secs, 0);
+    }
+
+    #[test]
+    fn grace_does_not_delay_exhaustion_once_billing_starts() {
+        let mut p = grace_policy();
+        p.weekday_secs = 240;
+        let mut l = Ledger::<2>::new();
+        let start = berlin(2026, 8, 3, 17, 0);
+
+        let mut exhausted_at = None;
+        for t in 0..=400 {
+            let (snap, ev) = l.tick(start + t, ONE_OUT, &p);
+            if ev.contains(&Event::Exhausted) {
+                exhausted_at = Some((t, snap.spent_secs));
+            }
+        }
+        // 240 s of budget, billed retroactively from the undock, so zero is reached at
+        // t=240 — grace delays the *display*, never the total.
+        assert_eq!(exhausted_at, Some((240, 240)));
     }
 
     #[test]

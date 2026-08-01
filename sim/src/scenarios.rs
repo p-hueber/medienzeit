@@ -114,5 +114,16 @@ pub fn all() -> Vec<Scenario> {
         });
     }
 
+    // Picked up 90 s ago to start a podcast — inside grace, nothing billed yet.
+    {
+        let mut l = Ledger::<2>::new();
+        let snap = run(&mut l, &p, berlin(2026, 8, 3, 16, 40), 90, ONE_OUT);
+        out.push(Scenario {
+            name: "08-grace",
+            description: "Brief pickup inside the grace period: dashed rule, budget untouched",
+            snapshot: snap,
+        });
+    }
+
     out
 }

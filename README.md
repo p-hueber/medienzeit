@@ -17,12 +17,13 @@ Full design, hardware BOM and milestones: `~/.claude/plans/so-i-have-issues-melo
 | `ui/` | `no_std`. Draws the 200x200 screen against any `embedded-graphics` `DrawTarget`, so the simulator and the real SSD1681 panel run the same code. |
 | `sim/` | Host binary. A virtual display driving the **real** ledger and the **real** drawing code, with only the clock and the NFC readers faked. |
 
-`firmware/` (ESP32-S3, embassy) and `tr064/` (Fritz!Box SOAP) land in M2 and M4.
+`pn5180/` (ISO 15693 reader driver, written from scratch), `firmware/` (ESP32-S3,
+embassy) and `tr064/` (Fritz!Box SOAP) land in M2, M3 and M5.
 
 ## Running
 
 ```sh
-cargo test                       # 29 tests, all host-side
+cargo test                       # 34 tests, all host-side
 cargo run -p medienzeit-sim      # interactive virtual display (needs SDL2)
 cargo run -p medienzeit-sim -- --shots shots/   # one PNG per screen state
 ```
@@ -48,6 +49,10 @@ chime; watching them here is how you check the edges fire exactly once.
 
 - **Wall-clock, not device-minutes.** The pool drains at 1x whenever *any* device is
   undocked. Both out still costs 1x. See `Ledger::any_undocked`.
+- **A 3-minute grace period** on every pickup, so grabbing a phone to skip a track,
+  start a podcast or answer a message costs nothing. Billing is **retroactive**: cross
+  the threshold and the *whole* pickup is charged, which is what stops short pickups
+  being farmed into free time. Set `Policy::grace_secs` to 0 to disable.
 - **Day resets at 04:00 local**, not midnight, so a late evening does not get a fresh
   allowance at the stroke of twelve. No carryover.
 - **Weekday and weekend allowances** (default 60 and 120 minutes). The day that began
