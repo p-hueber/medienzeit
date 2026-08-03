@@ -2,8 +2,11 @@
 //!
 //! Two things about this board that are not obvious and cost an evening each if missed:
 //!
-//! - **IO6 is `EPD3V3_EN`**, a power-rail enable for the panel. It must be driven high
-//!   or the display is simply dead — no error, no signal, nothing.
+//! - **IO6 is `EPD3V3_EN`, and it is ACTIVE LOW.** Drive it *low* to power the panel.
+//!   Driving it high leaves the display unpowered, and nothing reports an error: SPI
+//!   writes vanish, BUSY never asserts, so every `wait_until_idle` returns instantly and
+//!   the driver cheerfully claims the frame was displayed. Confirmed against Waveshare's
+//!   own `board_power_bsp.cpp`, where `POWEER_EPD_ON()` sets the level to 0.
 //! - The panel's SPI pins (IO8–IO13) are **not** on the expansion header. They are
 //!   dedicated, so the panel gets its own SPI peripheral and the header stays free.
 
@@ -83,8 +86,9 @@ impl Panel<'static> {
         let mut delay = Delay::new();
 
         // Power the panel first and let its rail settle before touching SPI.
-        let power = Output::new(pins.power_en, Level::High, OutputConfig::default());
-        delay.delay_millis(10);
+        // Active low: Level::Low is ON.
+        let power = Output::new(pins.power_en, Level::Low, OutputConfig::default());
+        delay.delay_millis(50);
 
         let cs = Output::new(pins.cs, Level::High, OutputConfig::default());
         let dc = Output::new(pins.dc, Level::Low, OutputConfig::default());
@@ -121,9 +125,7 @@ impl Panel<'static> {
         println!("panel: frame sent, refreshing");
         let _ = self.epd.display_frame(&mut self.spi, &mut self.delay);
         println!("panel: refreshed");
-        // NOTE: `epd.sleep()` hangs here — its opening `wait_until_idle` never returns
-        // even though `display_frame` has already completed and the image is on the
-        // panel. Left out until that is understood; skipping deep sleep costs some idle
-        // current and, over time, risks ghosting, so this is not the final answer.
+        let _ = self.epd.sleep(&mut self.spi, &mut self.delay);
+        println!("panel: asleep");
     }
 }
