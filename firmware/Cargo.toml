@@ -7,14 +7,20 @@ license = "MIT OR Apache-2.0"
 # Deliberately thin. Everything that can be decided without hardware lives in
 # `core/`, `ui/` and `tr064/`, all of which are tested on the host.
 #
-# No embassy yet. Every published `esp-hal-embassy` (0.8.x and 0.9.x) enables
-# `esp-hal/__esp_hal_embassy` from its default `executors` feature, and no released
-# `esp-hal` 1.x defines that feature — the pairing is simply broken on crates.io today.
-# Bring-up does not need async, so this is blocking `esp-hal` until that is resolved
-# (either a fixed release, or a git pin to a matching pair).
+# Async comes from `esp-rtos`, not `esp-hal-embassy`. The latter is the superseded
+# path: its default `executors` feature wants `esp-hal/__esp_hal_embassy`, which no
+# released esp-hal 1.x defines. `esp-rtos` is the current scheduler, and it is also
+# what `esp-radio` needs for its threads and queues.
 
 [dependencies]
 esp-hal = { version = "1.1", features = ["esp32s3", "unstable"] }
+esp-rtos = { version = "0.3", features = ["esp32s3", "embassy", "esp-radio", "esp-alloc"] }
+esp-alloc = "0.10"
+embassy-executor = "0.10"
+embassy-time = "0.5"
+embassy-net = { version = "0.7", features = ["dhcpv4", "udp", "medium-ethernet"] }
+esp-radio = { version = "0.18", features = ["esp32s3", "wifi", "unstable"] }
+static_cell = "2"
 esp-println = { version = "0.17", default-features = false, features = ["esp32s3", "jtag-serial"] }
 esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
 esp-bootloader-esp-idf = { version = "0.5", features = ["esp32s3"] }

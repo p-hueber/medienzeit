@@ -1,13 +1,21 @@
 #![no_std]
 #![no_main]
 
+mod net;
 mod panel;
 
 // Pulls in the panic handler and the backtrace printer; not referenced directly.
 use esp_backtrace as _;
+
+use embassy_executor::Spawner;
+use embassy_net::{Config as NetConfig, StackResources};
+use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
-use esp_hal::delay::Delay;
+use esp_hal::interrupt::software::SoftwareInterruptControl;
+use esp_hal::rng::Rng;
+use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
+use static_cell::StaticCell;
 
 use medienzeit_core::{Ledger, Policy};
 use medienzeit_ui::Chrome;
@@ -17,10 +25,16 @@ esp_bootloader_esp_idf::esp_app_desc!();
 const DOCKED: [bool; 2] = [true, true];
 const HOME: [bool; 2] = [true, true];
 
-#[esp_hal::main]
-fn main() -> ! {
+static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+
+#[esp_rtos::main]
+async fn main(spawner: Spawner) {
     let p = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
-    let delay = Delay::new();
+    esp_alloc::heap_allocator!(size: 72 * 1024);
+
+    let timg0 = TimerGroup::new(p.TIMG0);
+    let sw = SoftwareInterruptControl::new(p.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw.software_interrupt0);
     println!("medienzeit: booted");
 
     let mut panel = panel::Panel::new(
@@ -35,26 +49,64 @@ fn main() -> ! {
             mosi: p.GPIO13,
         },
     );
-    println!("medienzeit: panel up");
 
-    // No clock yet, so drive the real ledger from a fixed instant. The point of this
-    // step is to prove that the same `ui` code that renders the simulator PNGs also
-    // renders on the panel — not to be correct about the time.
+    // --- radio + network -------------------------------------------------
+    let (controller, interfaces) =
+        esp_radio::wifi::new(p.WIFI, Default::default()).expect("wifi init failed");
+
+    let rng = Rng::new();
+    let seed = ((rng.random() as u64) << 32) | rng.random() as u64;
+
+    let (stack, runner) = embassy_net::new(
+        interfaces.station,
+        NetConfig::dhcpv4(Default::default()),
+        RESOURCES.init(StackResources::new()),
+        seed,
+    );
+
+    spawner.spawn(net::connection(controller).unwrap());
+    spawner.spawn(net::net_task(runner).unwrap());
+
+    let cfg = net::wait_for_dhcp(stack).await;
+
+    // The ledger must not tick until the clock is trustworthy: a garbage timestamp
+    // would put the night window and the day arithmetic somewhere fictional.
+    let now = match cfg.gateway {
+        Some(gw) => match net::sntp_once(stack, gw).await {
+            Ok(t) => {
+                println!("medienzeit: unix time {t}");
+                t
+            }
+            Err(e) => {
+                println!("medienzeit: SNTP failed: {e}");
+                loop {
+                    Timer::after(Duration::from_secs(30)).await;
+                }
+            }
+        },
+        None => {
+            println!("medienzeit: no gateway from DHCP, cannot reach NTP");
+            loop {
+                Timer::after(Duration::from_secs(30)).await;
+            }
+        }
+    };
+
+    // --- first real frame ------------------------------------------------
     let policy = Policy::default();
     let mut ledger = Ledger::<2>::new(&policy);
-    // 2026-08-03 16:00 Europe/Berlin.
-    let (snapshot, _) = ledger.tick(1_785_945_600, DOCKED, HOME, &policy);
-    println!("medienzeit: balance {}s", snapshot.balance_secs);
+    let (snapshot, _) = ledger.tick(now, DOCKED, HOME, &policy);
+    println!(
+        "medienzeit: {:02}:{:02} local, balance {}s",
+        snapshot.local.hour, snapshot.local.minute, snapshot.balance_secs
+    );
 
     let mut fb = panel::Framebuffer::default();
     medienzeit_ui::render(&mut panel::InkTarget(&mut fb), &snapshot, &Chrome::default()).unwrap();
     panel.present(&fb);
     println!("medienzeit: frame presented");
 
-    let mut n = 0u32;
     loop {
-        println!("alive {n}");
-        n = n.wrapping_add(1);
-        delay.delay_millis(5_000);
+        Timer::after(Duration::from_secs(30)).await;
     }
 }
