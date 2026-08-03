@@ -30,6 +30,16 @@ fn main() {
         }
     }
 
+    // A floor for RTC plausibility. An RTC that has been running since the factory
+    // holds a wrong-but-well-formed time with its oscillator-stop flag clear, so
+    // nothing in the chip can flag it. Firmware cannot predate itself, so any stored
+    // time older than this build is definitionally untrustworthy.
+    let build_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before 1970")
+        .as_secs();
+    println!("cargo:rustc-env=MEDIENZEIT_BUILD_UNIX={build_unix}");
+
     let ssid = ssid.expect("wifi.toml is missing `ssid`");
     let psk = psk.expect("wifi.toml is missing `psk`");
     println!("cargo:rustc-env=MEDIENZEIT_SSID={ssid}");

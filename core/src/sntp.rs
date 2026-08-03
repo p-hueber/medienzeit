@@ -30,8 +30,17 @@ pub enum Error {
 
 /// A client request: LI = 0, VN = 4, Mode = 3, everything else zero.
 pub fn request() -> [u8; PACKET_LEN] {
+    const LEAP_INDICATOR: u8 = 0;
+    const VERSION: u8 = 4;
+    const MODE_CLIENT: u8 = 3;
+
     let mut p = [0u8; PACKET_LEN];
-    p[0] = (0 << 6) | (4 << 3) | 3;
+    // The `<< 6` on a zero leap indicator is deliberate: it documents the field layout
+    // of the first octet, which is otherwise three packed values in one byte.
+    #[allow(clippy::identity_op)]
+    {
+        p[0] = (LEAP_INDICATOR << 6) | (VERSION << 3) | MODE_CLIENT;
+    }
     p
 }
 
