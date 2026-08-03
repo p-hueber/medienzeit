@@ -1,0 +1,4 @@
+# ESP32-S3 is Xtensa, which stock Rust cannot target — this is Espressif's LLVM fork,
+# installed by `espup install`.
+[toolchain]
+channel = "esp"

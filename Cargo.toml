@@ -2,6 +2,10 @@
 resolver = "2"
 members = ["core", "ui", "sim", "tr064", "tr064-cli"]
 
+# `firmware/` is its own workspace: it targets xtensa-esp32s3-none-elf and needs a
+# different .cargo/config.toml and toolchain than everything above.
+exclude = ["firmware"]
+
 # `pn5180/` and `firmware/` join later. The firmware needs its own target
 # and linker config, so it will be excluded from this workspace when it lands.
 
