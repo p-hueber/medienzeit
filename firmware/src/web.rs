@@ -131,7 +131,23 @@ fn handle(request: &str, expected_auth: &str, snap: Option<&Snapshot<2>>) -> Str
     let mut granted = 0;
     if request.starts_with("POST") {
         granted = grant_minutes(request).min(60);
-        if granted > 0 {
+        // Alerting health. A push channel nobody checks is a push channel that has been
+    // broken for a month, so make its state impossible to miss on the page you
+    // actually open.
+    let h = crate::notify::health();
+    if h.failed_in_a_row > 0 {
+        let _ = write!(
+            out,
+            "<p style=\"color:#b00\"><b>Alerts failing</b> — {} in a row, {} sent overall.</p>",
+            h.failed_in_a_row, h.sent
+        );
+    } else if h.last_ok_ms.is_none() {
+        let _ = out.push_str("<p style=\"color:#666\">No alert sent yet this session.</p>");
+    } else {
+        let _ = write!(out, "<p style=\"color:#666\">Alerts OK — {} sent.</p>", h.sent);
+    }
+
+    if granted > 0 {
             BONUS.signal(granted * 60);
             println!("web: granted {granted} bonus minutes");
         }
@@ -216,6 +232,22 @@ fn page(out: &mut String<1024>, snap: Option<&Snapshot<2>>, granted: u32) {
                 blocked(s.blocked[1]),
             );
         }
+    }
+
+    // Alerting health. A push channel nobody checks is a push channel that has been
+    // broken for a month, so make its state impossible to miss on the page you
+    // actually open.
+    let h = crate::notify::health();
+    if h.failed_in_a_row > 0 {
+        let _ = write!(
+            out,
+            "<p style=\"color:#b00\"><b>Alerts failing</b> — {} in a row, {} sent overall.</p>",
+            h.failed_in_a_row, h.sent
+        );
+    } else if h.last_ok_ms.is_none() {
+        let _ = out.push_str("<p style=\"color:#666\">No alert sent yet this session.</p>");
+    } else {
+        let _ = write!(out, "<p style=\"color:#666\">Alerts OK — {} sent.</p>", h.sent);
     }
 
     if granted > 0 {

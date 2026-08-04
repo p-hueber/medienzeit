@@ -4,6 +4,7 @@
 mod chime;
 mod fritzbox;
 mod net;
+mod notify;
 mod panel;
 mod rtc;
 mod storage;
@@ -20,6 +21,8 @@ use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::rng::Rng;
 use esp_hal::timer::timg::TimerGroup;
+use core::fmt::Write as _;
+
 use esp_println::println;
 use heapless::String;
 use static_cell::StaticCell;
@@ -139,6 +142,18 @@ async fn main(spawner: Spawner) {
     spawner.spawn(net::connection(controller).unwrap());
     spawner.spawn(net::net_task(runner).unwrap());
     spawner.spawn(web::serve(stack).unwrap());
+    spawner.spawn(
+        notify::sender(
+            stack,
+            notify::Config {
+                host: parse_ipv4(env!("MEDIENZEIT_NTFY_HOST")),
+                port: env!("MEDIENZEIT_NTFY_PORT").parse().unwrap_or(80),
+                host_header: env!("MEDIENZEIT_NTFY_HEADER"),
+                topic: env!("MEDIENZEIT_NTFY_TOPIC"),
+            },
+        )
+        .unwrap(),
+    );
 
     let cfg = net::wait_for_dhcp(stack).await;
     let Some(gateway) = cfg.gateway else {
@@ -179,8 +194,14 @@ async fn main(spawner: Spawner) {
             let secs = outage.secs();
             if secs < 120 {
                 println!("  [alert] unit was off for {secs}s");
+                let mut m: notify::Message = heapless::String::new();
+                let _ = write!(m, "Gerät war {secs}s aus");
+                notify::send(&m);
             } else {
                 println!("  [alert] unit was off for {} min", secs / 60);
+                let mut m: notify::Message = heapless::String::new();
+                let _ = write!(m, "Gerät war {} min aus", secs / 60);
+                notify::send(&m);
             }
         }
     }
@@ -414,18 +435,38 @@ impl Screen {
     }
 }
 
+/// Log every event; push only the ones a parent would want to know about away from
+/// the house. Alerting on routine transitions would train you to ignore the channel,
+/// which costs more than the missed information.
 fn report(e: &Event) {
+    let mut push: notify::Message = heapless::String::new();
     match e {
-        Event::Exhausted => println!("  [event] EXHAUSTED"),
+        Event::Exhausted => {
+            println!("  [event] EXHAUSTED");
+            let _ = push.push_str("Zeit ist aufgebraucht");
+        }
+        Event::UndockedAtNight { device } => {
+            println!("  [event] {} TAKEN AWAY AT NIGHT", DEV_NAMES[*device]);
+            let _ = write!(push, "{} nachts weggenommen", DEV_NAMES[*device]);
+        }
         Event::Restored => println!("  [event] restored"),
         Event::Warning => println!("  [event] 5 minutes left"),
         Event::NightBegan => println!("  [event] night began"),
         Event::NightEnded => println!("  [event] night ended"),
-        Event::UndockedAtNight { device } => {
-            println!("  [event] {} TAKEN AWAY AT NIGHT", DEV_NAMES[*device])
-        }
         Event::TimeJump { gap_secs } => println!("  [event] time jump {gap_secs}s ignored"),
     }
+    if !push.is_empty() {
+        notify::send(&push);
+    }
+}
+
+/// Dotted-quad to an address, at runtime because `env!` yields a string.
+fn parse_ipv4(s: &str) -> embassy_net::IpAddress {
+    let mut octets = [0u8; 4];
+    for (i, part) in s.split('.').enumerate().take(4) {
+        octets[i] = part.parse().unwrap_or(0);
+    }
+    embassy_net::IpAddress::v4(octets[0], octets[1], octets[2], octets[3])
 }
 
 fn show(panel: &mut panel::Panel<'static>, snapshot: &Snapshot<2>, mode: panel::Refresh) {

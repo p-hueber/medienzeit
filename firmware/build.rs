@@ -33,6 +33,7 @@ fn main() {
     println!("cargo:rerun-if-changed=wifi.toml");
     println!("cargo:rerun-if-changed=fritzbox.toml");
     println!("cargo:rerun-if-changed=web.toml");
+    println!("cargo:rerun-if-changed=ntfy.toml");
     println!("cargo:rerun-if-changed=build.rs");
 
     let path = Path::new("wifi.toml");
@@ -85,6 +86,21 @@ fn main() {
     );
     // Admin page credentials. Separate from the TR-064 user on purpose: this one only
     // grants screen time, so it does not want the FRITZ!Box password behind it.
+    // ntfy endpoint. Plain HTTP so a self-hosted instance works today; ntfy.sh is
+    // HTTPS-only and needs the TLS path.
+    let ntfy = read_kv(
+        "ntfy.toml",
+        r#"    host  = "192.168.178.20"   # IP; the device does no DNS
+    port  = "80"
+    header = "ntfy.example.lan"  # Host: header, for reverse proxies
+    topic = "medienzeit-something-long-and-random"
+"#,
+    );
+    for key in ["host", "port", "header", "topic"] {
+        let v = require(&ntfy, "ntfy.toml", key);
+        println!("cargo:rustc-env=MEDIENZEIT_NTFY_{}={v}", key.to_uppercase());
+    }
+
     let web = read_kv(
         "web.toml",
         r#"    user = "papa"
