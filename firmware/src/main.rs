@@ -5,6 +5,7 @@ mod fritzbox;
 mod net;
 mod panel;
 mod rtc;
+mod storage;
 
 // Pulls in the panic handler and the backtrace printer; not referenced directly.
 use esp_backtrace as _;
@@ -37,6 +38,12 @@ const DEV_MACS: [&str; 2] = [
 
 /// How often to ask the FRITZ!Box where the devices are.
 const PRESENCE_PERIOD: Duration = Duration::from_secs(30);
+
+/// How often to journal the balance. A power cut costs at most this much.
+const JOURNAL_PERIOD: Duration = Duration::from_secs(30);
+
+/// Gaps shorter than this are a reboot, not someone pulling the plug.
+const OUTAGE_MIN_SECS: i64 = 5 * 60;
 
 /// Quick refreshes before forcing a full one to clear accumulated ghosting.
 ///
@@ -84,7 +91,13 @@ async fn main(spawner: Spawner) {
     let boot_button = Input::new(p.GPIO0, InputConfig::default().with_pull(Pull::Up));
 
     let policy = Policy::default();
-    let mut ledger = Ledger::<2>::new(&policy);
+
+    // Recover the balance before anything else can spend it.
+    let (mut journal, recovered) = storage::Journal::open(p.FLASH);
+    let mut ledger = match recovered {
+        Some(rec) => Ledger::<2>::with_balance(rec.balance_secs),
+        None => Ledger::<2>::new(&policy),
+    };
 
     let mut screen = Screen::default();
     let mut now = clock.startup_time();
@@ -135,6 +148,26 @@ async fn main(spawner: Spawner) {
         park().await
     };
 
+    // Now that the clock is trustworthy, work out how long the unit was off. The gap
+    // is never billed — a real power cut must not cost her the evening — but "unplug
+    // it" is otherwise the obvious way to stop the clock, so it gets reported.
+    if let Some(rec) = recovered {
+        if let Some(outage) = medienzeit_core::journal::detect_outage(
+            rec.last_tick,
+            start,
+            OUTAGE_MIN_SECS,
+        ) {
+            // Report seconds under two minutes: integer minutes would round a real
+            // outage down to "0 min", which reads as nothing having happened.
+            let secs = outage.secs();
+            if secs < 120 {
+                println!("  [alert] unit was off for {secs}s");
+            } else {
+                println!("  [alert] unit was off for {} min", secs / 60);
+            }
+        }
+    }
+
     // --- control loop ----------------------------------------------------
     let mut fb = fritzbox::Client::new(gateway);
     let mut state = Control::new(start);
@@ -155,6 +188,8 @@ async fn main(spawner: Spawner) {
     }
 
     let mut last_presence = Instant::now();
+    let mut last_journal = Instant::now();
+    let mut last_persisted_flow = None;
 
     loop {
         // The RTC is authoritative between SNTP syncs, so a missed tick or a slow
@@ -177,6 +212,16 @@ async fn main(spawner: Spawner) {
         state.apply_blocks(&mut fb, stack, &snapshot).await;
 
         screen.draw(&mut panel, &snapshot);
+
+        // Journal on a timer, and immediately whenever the flow changes — the moment
+        // spending starts or stops is exactly when a stale record would be wrong by
+        // the largest amount.
+        let flow_changed = last_persisted_flow != Some(snapshot.flow);
+        if flow_changed || last_journal.elapsed() >= JOURNAL_PERIOD {
+            last_journal = Instant::now();
+            last_persisted_flow = Some(snapshot.flow);
+            journal.append(snapshot.balance_secs, t);
+        }
 
         Timer::after(Duration::from_secs(1)).await;
     }
