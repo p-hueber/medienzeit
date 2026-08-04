@@ -18,7 +18,7 @@ esp-rtos = { version = "0.3", features = ["esp32s3", "embassy", "esp-radio", "es
 esp-alloc = "0.10"
 embassy-executor = "0.10"
 embassy-time = "0.5"
-embassy-net = { version = "0.7", features = ["dhcpv4", "udp", "medium-ethernet"] }
+embassy-net = { version = "0.7", features = ["dhcpv4", "udp", "tcp", "medium-ethernet"] }
 esp-radio = { version = "0.18", features = ["esp32s3", "wifi", "unstable"] }
 static_cell = "2"
 esp-println = { version = "0.17", default-features = false, features = ["esp32s3", "jtag-serial"] }
@@ -29,6 +29,9 @@ embedded-hal-bus = "0.3"
 epd-waveshare = "0.6"
 medienzeit-core = { path = "../core" }
 medienzeit-ui = { path = "../ui" }
+medienzeit-tr064 = { path = "../tr064" }
+embedded-io-async = "0.6"
+heapless = "0.8"
 
 [profile.release]
 opt-level = "s"

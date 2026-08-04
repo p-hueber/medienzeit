@@ -1309,6 +1309,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
+
+[[package]]
 name = "medienzeit-core"
 version = "0.1.0"
 dependencies = [
@@ -1324,6 +1334,7 @@ dependencies = [
  "embassy-time",
  "embedded-graphics",
  "embedded-hal-bus",
+ "embedded-io-async 0.6.1",
  "epd-waveshare",
  "esp-alloc",
  "esp-backtrace",
@@ -1332,9 +1343,19 @@ dependencies = [
  "esp-println",
  "esp-radio",
  "esp-rtos",
+ "heapless 0.8.0",
  "medienzeit-core",
+ "medienzeit-tr064",
  "medienzeit-ui",
  "static_cell",
+]
+
+[[package]]
+name = "medienzeit-tr064"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
+ "md-5",
 ]
 
 [[package]]

@@ -1,10 +1,37 @@
 //! Reads Wi-Fi credentials from `wifi.toml` and hands them to the compiler as env
 //! vars. The file is gitignored: the PSK belongs on this machine, not in the repo.
 
+use std::collections::HashMap;
 use std::path::Path;
+
+/// Parse a flat `key = "value"` file. Deliberately not a TOML dependency: these files
+/// have no structure worth a parser.
+fn read_kv(path: &str, template: &str) -> HashMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(Path::new(path)) else {
+        panic!("\n\n  firmware/{path} is missing. Create it with:\n\n{template}\n  It is gitignored.\n");
+    };
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            out.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
+        }
+    }
+    out
+}
+
+fn require(map: &HashMap<String, String>, file: &str, key: &str) -> String {
+    map.get(key)
+        .unwrap_or_else(|| panic!("firmware/{file} is missing `{key}`"))
+        .clone()
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=wifi.toml");
+    println!("cargo:rerun-if-changed=fritzbox.toml");
     println!("cargo:rerun-if-changed=build.rs");
 
     let path = Path::new("wifi.toml");
@@ -44,4 +71,26 @@ fn main() {
     let psk = psk.expect("wifi.toml is missing `psk`");
     println!("cargo:rustc-env=MEDIENZEIT_SSID={ssid}");
     println!("cargo:rustc-env=MEDIENZEIT_PSK={psk}");
+
+    let fb = read_kv(
+        "fritzbox.toml",
+        r#"    user = "medienzeit"
+    pass = "the dedicated TR-064 user's password"
+    device1_name = "Handy"
+    device1_mac  = "aa:bb:cc:dd:ee:ff"
+    device2_name = "Tablet"
+    device2_mac  = "11:22:33:44:55:66"
+"#,
+    );
+    for key in [
+        "user",
+        "pass",
+        "device1_name",
+        "device1_mac",
+        "device2_name",
+        "device2_mac",
+    ] {
+        let v = require(&fb, "fritzbox.toml", key);
+        println!("cargo:rustc-env=MEDIENZEIT_FB_{}={v}", key.to_uppercase());
+    }
 }
