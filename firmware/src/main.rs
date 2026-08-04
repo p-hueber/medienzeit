@@ -38,6 +38,12 @@ const DEV_MACS: [&str; 2] = [
 /// How often to ask the FRITZ!Box where the devices are.
 const PRESENCE_PERIOD: Duration = Duration::from_secs(30);
 
+/// Quick refreshes before forcing a full one to clear accumulated ghosting.
+///
+/// At one update per minute that is a flash every half hour, which is roughly the
+/// point at which ghosting becomes noticeable on this panel.
+const QUICK_REFRESHES_PER_FULL: u32 = 30;
+
 static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 
 #[esp_rtos::main]
@@ -80,10 +86,11 @@ async fn main(spawner: Spawner) {
     let policy = Policy::default();
     let mut ledger = Ledger::<2>::new(&policy);
 
+    let mut screen = Screen::default();
     let mut now = clock.startup_time();
     if let Some(t) = now {
         let (snapshot, _) = ledger.tick(t, [true; 2], [false; 2], &policy);
-        show(&mut panel, &snapshot);
+        screen.draw(&mut panel, &snapshot);
     }
 
     // --- radio + network -------------------------------------------------
@@ -148,7 +155,6 @@ async fn main(spawner: Spawner) {
     }
 
     let mut last_presence = Instant::now();
-    let mut last_fingerprint = None;
 
     loop {
         // The RTC is authoritative between SNTP syncs, so a missed tick or a slow
@@ -170,12 +176,7 @@ async fn main(spawner: Spawner) {
 
         state.apply_blocks(&mut fb, stack, &snapshot).await;
 
-        // e-paper is slow and finite: only redraw when something visible changed.
-        let fingerprint = fingerprint(&snapshot);
-        if last_fingerprint != Some(fingerprint) {
-            last_fingerprint = Some(fingerprint);
-            show(&mut panel, &snapshot);
-        }
+        screen.draw(&mut panel, &snapshot);
 
         Timer::after(Duration::from_secs(1)).await;
     }
@@ -268,15 +269,72 @@ fn label(blocked: bool) -> &'static str {
 }
 
 /// Everything the screen actually shows. Redrawing on anything else wastes a refresh.
-fn fingerprint(s: &Snapshot<2>) -> (i32, u32, u32, bool, bool, [bool; 2]) {
+type Fingerprint = (i32, u32, u32, bool, medienzeit_core::Flow, [bool; 2]);
+
+fn fingerprint(s: &Snapshot<2>) -> Fingerprint {
     (
         s.balance_secs / 60,
         s.local.hour,
         s.local.minute,
         s.night,
-        matches!(s.flow, medienzeit_core::Flow::Draining),
+        s.flow,
         s.docked,
     )
+}
+
+/// Decides *whether* to redraw and *how*.
+///
+/// E-paper updates are slow and the panel has a finite number of them, so the screen
+/// is only touched when something visible changed. Most of those changes are one digit
+/// of a countdown, which the quick waveform handles without flashing the whole panel.
+#[derive(Default)]
+struct Screen {
+    last: Option<Fingerprint>,
+    quick_since_full: u32,
+}
+
+impl Screen {
+    fn draw(&mut self, panel: &mut panel::Panel<'static>, snapshot: &Snapshot<2>) {
+        let now = fingerprint(snapshot);
+        let Some(previous) = self.last else {
+            // First frame of the session: nothing is on the panel we can trust.
+            self.present(panel, snapshot, now, panel::Refresh::Full);
+            return;
+        };
+        if previous == now {
+            return;
+        }
+
+        // A lockout is the one transition that inverts the entire screen. Doing that
+        // with the quick waveform leaves the old image ghosted through the new one,
+        // which is exactly when legibility matters most.
+        let lockout_changed = previous.3 != now.3 || (previous.0 <= 0) != (now.0 <= 0);
+        let mode = if lockout_changed || self.quick_since_full >= QUICK_REFRESHES_PER_FULL {
+            panel::Refresh::Full
+        } else {
+            panel::Refresh::Quick
+        };
+        self.present(panel, snapshot, now, mode);
+    }
+
+    fn present(
+        &mut self,
+        panel: &mut panel::Panel<'static>,
+        snapshot: &Snapshot<2>,
+        fp: Fingerprint,
+        mode: panel::Refresh,
+    ) {
+        println!(
+            "screen: {:?} redraw at {:02}:{:02}, balance {}s",
+            mode, snapshot.local.hour, snapshot.local.minute, snapshot.balance_secs
+        );
+        show(panel, snapshot, mode);
+        self.last = Some(fp);
+        self.quick_since_full = match mode {
+            panel::Refresh::Full => 0,
+            panel::Refresh::Quick => self.quick_since_full + 1,
+        };
+    }
 }
 
 fn report(e: &Event) {
@@ -293,11 +351,11 @@ fn report(e: &Event) {
     }
 }
 
-fn show(panel: &mut panel::Panel<'static>, snapshot: &Snapshot<2>) {
+fn show(panel: &mut panel::Panel<'static>, snapshot: &Snapshot<2>, mode: panel::Refresh) {
     let mut fbuf = panel::Framebuffer::default();
     let chrome = Chrome { device_names: DEV_NAMES };
     medienzeit_ui::render(&mut panel::InkTarget(&mut fbuf), snapshot, &chrome).unwrap();
-    panel.present(&fbuf);
+    panel.present(&fbuf, mode);
 }
 
 async fn park() -> ! {

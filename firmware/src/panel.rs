@@ -15,6 +15,7 @@ use embedded_graphics::prelude::*;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use epd_waveshare::color::Color;
 use epd_waveshare::epd1in54_v2::Epd1in54;
+use epd_waveshare::prelude::RefreshLut;
 use epd_waveshare::graphics::Display as EpdDisplay;
 use epd_waveshare::prelude::*;
 use esp_hal::delay::Delay;
@@ -63,10 +64,35 @@ impl OriginDimensions for InkTarget<'_> {
 
 type PanelSpi<'d> = ExclusiveDevice<Spi<'d, esp_hal::Blocking>, Output<'d>, Delay>;
 
+/// How the panel should be driven for one update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresh {
+    /// The full waveform: inverts the panel a few times, takes ~2 s, and is visibly
+    /// disruptive. Clears accumulated ghosting.
+    Full,
+    /// The quick waveform: no inversion flashing, far faster. Ghosting builds up over
+    /// many consecutive quick updates, so it needs a periodic full refresh to clear.
+    Quick,
+}
+
+impl From<Refresh> for RefreshLut {
+    fn from(r: Refresh) -> Self {
+        match r {
+            Refresh::Full => RefreshLut::Full,
+            Refresh::Quick => RefreshLut::Quick,
+        }
+    }
+}
+
 pub struct Panel<'d> {
     spi: PanelSpi<'d>,
     epd: Epd1in54<PanelSpi<'d>, Input<'d>, Output<'d>, Output<'d>, Delay>,
     delay: Delay,
+    /// Deep sleep ignores commands until the controller is woken, so this has to be
+    /// tracked: updating a sleeping panel silently does nothing.
+    asleep: bool,
+    /// Which waveform is currently loaded, to skip redundant LUT uploads.
+    lut: Option<Refresh>,
     /// Held so the panel's 3V3 rail stays enabled for the lifetime of the driver.
     _power: Output<'d>,
 }
@@ -112,20 +138,32 @@ impl Panel<'static> {
             .expect("e-paper init failed — is IO6 (EPD3V3_EN) high?");
         println!("panel: init ok");
 
-        Self { spi, epd, delay, _power: power }
+        Self { spi, epd, delay, asleep: false, lut: None, _power: power }
     }
 
-    /// Push a framebuffer and refresh, then sleep the panel.
+    /// Push a framebuffer and refresh, then put the controller back to sleep.
     ///
-    /// Sleeping between updates matters on e-paper: leaving the controller awake with a
-    /// charged panel is what produces long-term ghosting.
-    pub fn present(&mut self, fb: &Framebuffer) {
-        println!("panel: sending {} bytes", fb.buffer().len());
+    /// Waking is not optional: the controller ignores commands in deep sleep, so
+    /// without this the second update of the session would silently do nothing while
+    /// every call still reported success.
+    pub fn present(&mut self, fb: &Framebuffer, mode: Refresh) {
+        if self.asleep {
+            let _ = self.epd.wake_up(&mut self.spi, &mut self.delay);
+            self.asleep = false;
+            // Waking re-initialises the controller, so any loaded waveform is gone.
+            self.lut = None;
+        }
+
+        if self.lut != Some(mode) {
+            let _ = self
+                .epd
+                .set_lut(&mut self.spi, &mut self.delay, Some(mode.into()));
+            self.lut = Some(mode);
+        }
+
         let _ = self.epd.update_frame(&mut self.spi, fb.buffer(), &mut self.delay);
-        println!("panel: frame sent, refreshing");
         let _ = self.epd.display_frame(&mut self.spi, &mut self.delay);
-        println!("panel: refreshed");
         let _ = self.epd.sleep(&mut self.spi, &mut self.delay);
-        println!("panel: asleep");
+        self.asleep = true;
     }
 }
