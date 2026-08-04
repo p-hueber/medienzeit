@@ -32,6 +32,7 @@ fn require(map: &HashMap<String, String>, file: &str, key: &str) -> String {
 fn main() {
     println!("cargo:rerun-if-changed=wifi.toml");
     println!("cargo:rerun-if-changed=fritzbox.toml");
+    println!("cargo:rerun-if-changed=web.toml");
     println!("cargo:rerun-if-changed=build.rs");
 
     let path = Path::new("wifi.toml");
@@ -82,6 +83,19 @@ fn main() {
     device2_mac  = "11:22:33:44:55:66"
 "#,
     );
+    // Admin page credentials. Separate from the TR-064 user on purpose: this one only
+    // grants screen time, so it does not want the FRITZ!Box password behind it.
+    let web = read_kv(
+        "web.toml",
+        r#"    user = "papa"
+    pass = "something only you know"
+"#,
+    );
+    for key in ["user", "pass"] {
+        let v = require(&web, "web.toml", key);
+        println!("cargo:rustc-env=MEDIENZEIT_WEB_{}={v}", key.to_uppercase());
+    }
+
     for key in [
         "user",
         "pass",

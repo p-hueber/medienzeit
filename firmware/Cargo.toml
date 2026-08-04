@@ -20,6 +20,7 @@ esp-storage = { version = "0.9", features = ["esp32s3"] }
 embedded-storage = "0.3"
 embassy-executor = "0.10"
 embassy-time = "0.5"
+embassy-sync = "0.7"
 embassy-net = { version = "0.7", features = ["dhcpv4", "udp", "tcp", "medium-ethernet"] }
 esp-radio = { version = "0.18", features = ["esp32s3", "wifi", "unstable"] }
 static_cell = "2"

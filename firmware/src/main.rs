@@ -7,6 +7,7 @@ mod net;
 mod panel;
 mod rtc;
 mod storage;
+mod web;
 
 // Pulls in the panic handler and the backtrace printer; not referenced directly.
 use esp_backtrace as _;
@@ -124,6 +125,7 @@ async fn main(spawner: Spawner) {
     if let Some(t) = now {
         let (snapshot, _) = ledger.tick(t, [true; 2], [false; 2], &policy);
         screen.draw(&mut panel, &snapshot);
+        web::publish(snapshot.clone());
     }
 
     // --- radio + network -------------------------------------------------
@@ -142,6 +144,7 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(net::connection(controller).unwrap());
     spawner.spawn(net::net_task(runner).unwrap());
+    spawner.spawn(web::serve(stack).unwrap());
 
     let cfg = net::wait_for_dhcp(stack).await;
     let Some(gateway) = cfg.gateway else {
@@ -216,6 +219,13 @@ async fn main(spawner: Spawner) {
         // network call cannot make the ledger lose time.
         let t = rtc::now(&mut i2c).unwrap_or(state.last_tick + 1);
 
+        // A grant from the admin page arrives out of band; apply it before the tick
+        // so the new balance is what gets journalled and displayed this second.
+        if let Some(secs) = web::BONUS.try_take() {
+            ledger.grant_bonus(secs, &policy);
+            println!("medienzeit: +{}s granted", secs);
+        }
+
         let docked = [boot_button.is_high(), true];
         let (snapshot, events) = ledger.tick(t, docked, state.present, &policy);
         state.last_tick = t;
@@ -239,6 +249,7 @@ async fn main(spawner: Spawner) {
         state.apply_blocks(&mut fb, stack, &snapshot).await;
 
         screen.draw(&mut panel, &snapshot);
+        web::publish(snapshot.clone());
 
         // Journal on a timer, and immediately whenever the flow changes — the moment
         // spending starts or stops is exactly when a stale record would be wrong by
