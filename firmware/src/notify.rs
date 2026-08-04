@@ -18,8 +18,11 @@
 use core::cell::RefCell;
 use core::fmt::Write as _;
 
+use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{IpAddress, Stack};
+use embedded_tls::{Aes128GcmSha256, NoVerify, TlsConfig, TlsConnection, TlsContext};
+use static_cell::StaticCell;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
@@ -69,25 +72,70 @@ pub fn send(text: &str) {
 }
 
 pub struct Config {
-    pub host: IpAddress,
+    /// Literal address for a self-hosted instance, or `None` to resolve `host_name`.
+    pub host: Option<IpAddress>,
     pub port: u16,
-    /// Host header value — ntfy routes on it, and a self-hosted instance behind a
-    /// reverse proxy needs it to match.
+    /// Host header value, and the DNS name and SNI name when TLS is used.
     pub host_header: &'static str,
     pub topic: &'static str,
+    /// Wrap the connection in TLS.
+    ///
+    /// **Server certificates are not verified.** Deliberate: the payload is "she took
+    /// the phone at 23:40", nobody's secret, and verification protects against
+    /// impersonation rather than against an attacker simply dropping the traffic —
+    /// which is the failure that would actually matter here, and which no amount of
+    /// certificate checking prevents. Pinning a root would also mean the alerts die
+    /// silently the day that root rotates. What does leak to a man in the middle is
+    /// the topic name, which ntfy treats as a bearer token for publish and subscribe.
+    pub tls: bool,
 }
+
+/// TLS record buffers. Statics rather than task locals: 16 KB each would blow the
+/// task stack, and only one alert is ever in flight.
+static TLS_RX: StaticCell<[u8; 16384]> = StaticCell::new();
+static TLS_TX: StaticCell<[u8; 16384]> = StaticCell::new();
+
+/// `embedded-tls` wants a `rand_core` 0.6 CSPRNG; esp-hal's hardware RNG is one.
+struct HwRng(esp_hal::rng::Rng);
+
+impl rand_core::RngCore for HwRng {
+    fn next_u32(&mut self) -> u32 {
+        self.0.random()
+    }
+    fn next_u64(&mut self) -> u64 {
+        ((self.next_u32() as u64) << 32) | self.next_u32() as u64
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        for chunk in dest.chunks_mut(4) {
+            let word = self.next_u32().to_le_bytes();
+            chunk.copy_from_slice(&word[..chunk.len()]);
+        }
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+impl rand_core::CryptoRng for HwRng {}
 
 #[embassy_executor::task]
 pub async fn sender(stack: Stack<'static>, cfg: Config) {
     println!(
-        "notify: sender up, posting to {}:{}/{}",
-        cfg.host_header, cfg.port, cfg.topic
+        "notify: sender up, posting to {}{}:{}/{} ",
+        if cfg.tls { "https://" } else { "http://" },
+        cfg.host_header,
+        cfg.port,
+        cfg.topic
     );
+
+    let tls_rx = TLS_RX.init([0; 16384]);
+    let tls_tx = TLS_TX.init([0; 16384]);
 
     loop {
         let msg = QUEUE.receive().await;
 
-        match post(stack, &cfg, &msg).await {
+        match post(stack, &cfg, &msg, tls_rx, tls_tx).await {
             Ok(()) => HEALTH.lock(|c| {
                 let mut h = c.borrow_mut();
                 h.sent += 1;
@@ -106,15 +154,36 @@ pub async fn sender(stack: Stack<'static>, cfg: Config) {
     }
 }
 
-async fn post(stack: Stack<'static>, cfg: &Config, msg: &str) -> Result<(), &'static str> {
-    let mut rx = [0u8; 1024];
-    let mut tx = [0u8; 1024];
-    let mut sock = TcpSocket::new(stack, &mut rx, &mut tx);
-    sock.set_timeout(Some(Duration::from_secs(10)));
+async fn post(
+    stack: Stack<'static>,
+    cfg: &Config,
+    msg: &str,
+    tls_rx: &mut [u8],
+    tls_tx: &mut [u8],
+) -> Result<(), &'static str> {
+    // A literal address wins; otherwise resolve. DNS is only needed for the public
+    // service — a self-hosted instance is configured by IP so boot has one less
+    // dependency.
+    let addr = match cfg.host {
+        Some(a) => a,
+        None => {
+            *stack
+            .dns_query(cfg.host_header, DnsQueryType::A)
+            .await
+                .map_err(|_| "dns")?
+                .first()
+                .ok_or("dns empty")?
+        }
+    };
 
-    sock.connect((cfg.host, cfg.port))
-        .await
-        .map_err(|_| "connect")?;
+    // 4 KB rather than 1 KB: a TLS handshake flight (certificate chain) is far bigger
+    // than anything the plain-HTTP path ever sees.
+    let mut rx = [0u8; 4096];
+    let mut tx = [0u8; 4096];
+    let mut sock = TcpSocket::new(stack, &mut rx, &mut tx);
+    sock.set_timeout(Some(Duration::from_secs(15)));
+
+    sock.connect((addr, cfg.port)).await.map_err(|_| "connect")?;
 
     let mut head: String<512> = String::new();
     write!(
@@ -131,15 +200,38 @@ async fn post(stack: Stack<'static>, cfg: &Config, msg: &str) -> Result<(), &'st
     )
     .map_err(|_| "request too long")?;
 
-    sock.write_all(head.as_bytes()).await.map_err(|_| "write")?;
-    sock.write_all(msg.as_bytes()).await.map_err(|_| "write")?;
-    sock.flush().await.map_err(|_| "flush")?;
-
-    // Read just enough for the status line. ntfy answers with a JSON body we do not
-    // care about, and `Connection: close` means we can stop reading whenever we like.
     let mut buf = [0u8; 128];
-    let n = sock.read(&mut buf).await.map_err(|_| "read")?;
-    sock.close();
+    let n = if cfg.tls {
+        // RSA is opt-in in embedded-tls, and public CAs still issue RSA chains.
+        let tls_config = TlsConfig::new()
+            .with_server_name(cfg.host_header)
+            .enable_rsa_signatures();
+        let mut tls: TlsConnection<'_, TcpSocket, Aes128GcmSha256> =
+            TlsConnection::new(sock, tls_rx, tls_tx);
+        let mut rng = HwRng(esp_hal::rng::Rng::new());
+        tls.open::<HwRng, NoVerify>(TlsContext::new(&tls_config, &mut rng))
+            .await
+            .map_err(|e| {
+                println!("notify: tls error {e:?}");
+                "tls handshake"
+            })?;
+
+        tls.write(head.as_bytes()).await.map_err(|_| "write")?;
+        tls.write(msg.as_bytes()).await.map_err(|_| "write")?;
+        tls.flush().await.map_err(|_| "flush")?;
+        let n = tls.read(&mut buf).await.map_err(|_| "read")?;
+        let _ = tls.close().await;
+        n
+    } else {
+        sock.write_all(head.as_bytes()).await.map_err(|_| "write")?;
+        sock.write_all(msg.as_bytes()).await.map_err(|_| "write")?;
+        sock.flush().await.map_err(|_| "flush")?;
+        // Read just enough for the status line; `Connection: close` means we can stop
+        // reading whenever we like, and ntfy's JSON body is of no interest.
+        let n = sock.read(&mut buf).await.map_err(|_| "read")?;
+        sock.close();
+        n
+    };
 
     let text = core::str::from_utf8(&buf[..n]).map_err(|_| "not utf-8")?;
     let status: u16 = text

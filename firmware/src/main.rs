@@ -56,7 +56,10 @@ const OUTAGE_MIN_SECS: i64 = 5 * 60;
 /// point at which ghosting becomes noticeable on this panel.
 const QUICK_REFRESHES_PER_FULL: u32 = 30;
 
-static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+/// Socket budget. DHCP, DNS, the admin server's listener, one transient TR-064
+/// connection and one transient alert connection — with headroom, because running out
+/// does not fail loudly, it just makes `connect` hang forever.
+static RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
@@ -146,10 +149,13 @@ async fn main(spawner: Spawner) {
         notify::sender(
             stack,
             notify::Config {
+                // An empty host means "resolve the header name", which is how the
+                // public service is reached; a literal IP is how a self-hosted one is.
                 host: parse_ipv4(env!("MEDIENZEIT_NTFY_HOST")),
                 port: env!("MEDIENZEIT_NTFY_PORT").parse().unwrap_or(80),
                 host_header: env!("MEDIENZEIT_NTFY_HEADER"),
                 topic: env!("MEDIENZEIT_NTFY_TOPIC"),
+                tls: env!("MEDIENZEIT_NTFY_TLS") == "true",
             },
         )
         .unwrap(),
@@ -461,12 +467,16 @@ fn report(e: &Event) {
 }
 
 /// Dotted-quad to an address, at runtime because `env!` yields a string.
-fn parse_ipv4(s: &str) -> embassy_net::IpAddress {
+///
+/// An empty or unparseable value yields `None`, meaning "resolve by name instead".
+fn parse_ipv4(s: &str) -> Option<embassy_net::IpAddress> {
     let mut octets = [0u8; 4];
+    let mut n = 0;
     for (i, part) in s.split('.').enumerate().take(4) {
-        octets[i] = part.parse().unwrap_or(0);
+        octets[i] = part.parse().ok()?;
+        n += 1;
     }
-    embassy_net::IpAddress::v4(octets[0], octets[1], octets[2], octets[3])
+    (n == 4).then(|| embassy_net::IpAddress::v4(octets[0], octets[1], octets[2], octets[3]))
 }
 
 fn show(panel: &mut panel::Panel<'static>, snapshot: &Snapshot<2>, mode: panel::Refresh) {

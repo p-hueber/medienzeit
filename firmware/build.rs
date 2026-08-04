@@ -94,9 +94,10 @@ fn main() {
     port  = "80"
     header = "ntfy.example.lan"  # Host: header, for reverse proxies
     topic = "medienzeit-something-long-and-random"
+    tls   = "false"           # "true" for ntfy.sh; certificates are not verified
 "#,
     );
-    for key in ["host", "port", "header", "topic"] {
+    for key in ["host", "port", "header", "topic", "tls"] {
         let v = require(&ntfy, "ntfy.toml", key);
         println!("cargo:rustc-env=MEDIENZEIT_NTFY_{}={v}", key.to_uppercase());
     }

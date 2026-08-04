@@ -21,7 +21,7 @@ embedded-storage = "0.3"
 embassy-executor = "0.10"
 embassy-time = "0.5"
 embassy-sync = "0.7"
-embassy-net = { version = "0.7", features = ["dhcpv4", "udp", "tcp", "medium-ethernet"] }
+embassy-net = { version = "0.7", features = ["dhcpv4", "udp", "tcp", "dns", "medium-ethernet"] }
 esp-radio = { version = "0.18", features = ["esp32s3", "wifi", "unstable"] }
 static_cell = "2"
 esp-println = { version = "0.17", default-features = false, features = ["esp32s3", "jtag-serial"] }
@@ -35,6 +35,8 @@ medienzeit-core = { path = "../core" }
 medienzeit-ui = { path = "../ui" }
 medienzeit-tr064 = { path = "../tr064" }
 embedded-io-async = "0.6"
+embedded-tls = { version = "0.17", default-features = false }
+rand_core = { version = "0.6", default-features = false }
 heapless = "0.8"
 
 [profile.release]
