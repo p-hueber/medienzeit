@@ -100,12 +100,6 @@ async fn main(spawner: Spawner) {
         &mut i2c,
     );
 
-    // One-shot at boot so the speaker path can be verified without waiting for a real
-    // five-minute warning. Total duration is compile-time bounded well under a second.
-    if let Some(c) = chime.as_mut() {
-        println!("chime: self-test");
-        c.warning();
-    }
 
     // Stand-in for the NFC reader until it arrives: BOOT toggles device 1's presence
     // at the reader, so the whole spend/block path can be exercised by hand.

@@ -16,7 +16,7 @@ use es8311::{ClockConfig, Es8311, Resolution};
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::i2c::master::I2c;
-use esp_hal::i2s::master::{Config as I2sConfig, DataFormat, I2s, I2sTx, UnitConfig};
+use esp_hal::i2s::master::{Channels, Config as I2sConfig, DataFormat, I2s, I2sTx, UnitConfig};
 use esp_hal::time::Rate;
 use esp_hal::Blocking;
 use esp_println::println;
@@ -103,9 +103,25 @@ impl Chime<'static> {
             println!("chime: ES8311 volume failed ({e:?}), running silent");
             return None;
         }
+        // Waveshare's example does this too; the mic path shares registers with the
+        // DAC path on this part.
+        if let Err(e) = codec.microphone_config(i2c, false) {
+            println!("chime: ES8311 mic config failed ({e:?})");
+        }
 
+        // Read the volume back: proves the codec is actually alive and holding
+        // configuration, rather than merely ACKing writes into the void.
+        match codec.volume_get(i2c) {
+            Ok(v) => println!("chime: codec volume reads back as {v}"),
+            Err(e) => println!("chime: codec readback failed ({e:?})"),
+        }
+
+        // MONO, not STEREO: the tone buffer is a single channel of samples. With a
+        // stereo slot config each sample would land alternately in L and R, halving
+        // the pitch and mangling the waveform.
         let unit = UnitConfig::new_tdm_philips()
             .with_sample_rate(Rate::from_hz(SAMPLE_RATE))
+            .with_channels(Channels::MONO)
             .with_data_format(DataFormat::Data16Channel16);
         let cfg = I2sConfig::new_tdm_philips().with_tx_config(unit);
 
@@ -117,7 +133,9 @@ impl Chime<'static> {
             }
         };
 
-        let (_, descriptors) = esp_hal::dma_descriptors!(0, 4096);
+        // Must cover the largest tone we can produce. Sized at 4096 this silently
+        // could not describe a full buffer.
+        let (_, descriptors) = esp_hal::dma_descriptors!(0, MAX_SAMPLES * 2);
         let tx = i2s
             .i2s_tx
             .with_bclk(pins.bclk)
@@ -154,6 +172,28 @@ impl Chime<'static> {
         // Amplifier off immediately: idling it hisses, and a chime that becomes
         // background noise stops being a signal.
         self.pa_ctrl.set_low();
+    }
+
+    /// Diagnostic, kept for whenever the speaker question is settled.
+    ///
+    /// Toggle the amplifier enable and nothing else.
+    ///
+    /// A class-D amplifier pops when its output stage switches on and off, so if the
+    /// amp is powered and the speaker is connected this is audible even with no signal
+    /// at all. It splits the fault cleanly: clicks mean the amp and speaker are fine
+    /// and the problem is upstream in the codec or the I²S clocks; silence means the
+    /// enable line or the speaker connection, and everything done to the codec so far
+    /// is beside the point.
+    ///
+    /// Ten pops over 300 ms, well inside the one-second ceiling.
+    #[allow(dead_code)] // bring-up diagnostic, called by hand
+    pub fn click_test(&mut self) {
+        for _ in 0..10 {
+            self.pa_ctrl.set_high();
+            self.delay.delay_millis(15);
+            self.pa_ctrl.set_low();
+            self.delay.delay_millis(15);
+        }
     }
 
     /// Two rising notes — distinguishable from a notification without being alarming.
