@@ -29,6 +29,7 @@ esp-bootloader-esp-idf = { version = "0.5", features = ["esp32s3"] }
 embedded-graphics = "0.8"
 embedded-hal-bus = "0.3"
 epd-waveshare = "0.6"
+es8311 = "0.1"
 medienzeit-core = { path = "../core" }
 medienzeit-ui = { path = "../ui" }
 medienzeit-tr064 = { path = "../tr064" }

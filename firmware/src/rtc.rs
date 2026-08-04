@@ -26,66 +26,55 @@ const BUILD_UNIX: i64 = {
     acc
 };
 
-pub struct Rtc<'d> {
-    i2c: I2c<'d, Blocking>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Bus,
     Codec(codec::Error),
 }
 
-impl<'d> Rtc<'d> {
-    pub fn new(i2c: I2c<'d, Blocking>) -> Self {
-        Self { i2c }
-    }
+/// Read the current UTC unix timestamp.
+///
+/// Returns [`codec::Error::ClockIntegrityLost`] when the oscillator-stop flag is set,
+/// which is what a fresh or power-cut board reports. That is a normal startup state,
+/// not a fault.
+pub fn now(i2c: &mut I2c<'_, Blocking>) -> Result<i64, Error> {
+    let mut regs = [0u8; codec::TIME_REGS];
+    i2c.write_read(codec::ADDRESS, &[codec::REG_SECONDS], &mut regs)
+        .map_err(|_| Error::Bus)?;
+    codec::decode(&regs).map_err(Error::Codec)
+}
 
-    /// Read the current UTC unix timestamp.
-    ///
-    /// Returns [`codec::Error::ClockIntegrityLost`] when the oscillator-stop flag is
-    /// set, which is what a fresh or power-cut board reports. That is a normal startup
-    /// state, not a fault.
-    pub fn now(&mut self) -> Result<i64, Error> {
-        let mut regs = [0u8; codec::TIME_REGS];
-        self.i2c
-            .write_read(codec::ADDRESS, &[codec::REG_SECONDS], &mut regs)
-            .map_err(|_| Error::Bus)?;
-        codec::decode(&regs).map_err(Error::Codec)
-    }
+/// Set the clock from a UTC unix timestamp. Clears the oscillator-stop flag.
+pub fn set(i2c: &mut I2c<'_, Blocking>, utc: i64) -> Result<(), Error> {
+    let regs = codec::encode(utc).map_err(Error::Codec)?;
+    let mut buf = [0u8; codec::TIME_REGS + 1];
+    buf[0] = codec::REG_SECONDS;
+    buf[1..].copy_from_slice(&regs);
+    i2c.write(codec::ADDRESS, &buf).map_err(|_| Error::Bus)
+}
 
-    /// Set the clock from a UTC unix timestamp. Clears the oscillator-stop flag.
-    pub fn set(&mut self, utc: i64) -> Result<(), Error> {
-        let regs = codec::encode(utc).map_err(Error::Codec)?;
-        let mut buf = [0u8; codec::TIME_REGS + 1];
-        buf[0] = codec::REG_SECONDS;
-        buf[1..].copy_from_slice(&regs);
-        self.i2c.write(codec::ADDRESS, &buf).map_err(|_| Error::Bus)
-    }
-
-    /// Best-effort read for startup: logs what happened and yields a timestamp only if
-    /// the clock is genuinely trustworthy.
-    pub fn startup_time(&mut self) -> Option<i64> {
-        match self.now() {
-            Ok(t) if t < BUILD_UNIX => {
-                // Well-formed but older than this firmware, so it cannot be real. A
-                // factory-tested board arrives exactly like this: oscillator running
-                // since the production line, stop flag clear, time a year stale.
-                println!("rtc: time {t} predates this build, ignoring");
-                None
-            }
-            Ok(t) => {
-                println!("rtc: holding time, unix {t}");
-                Some(t)
-            }
-            Err(Error::Codec(codec::Error::ClockIntegrityLost)) => {
-                println!("rtc: oscillator stopped, time unknown until SNTP");
-                None
-            }
-            Err(e) => {
-                println!("rtc: unusable ({e:?})");
-                None
-            }
+/// Best-effort read for startup: logs what happened and yields a timestamp only if the
+/// clock is genuinely trustworthy.
+pub fn startup_time(i2c: &mut I2c<'_, Blocking>) -> Option<i64> {
+    match now(i2c) {
+        // Well-formed but older than this firmware, so it cannot be real. A
+        // factory-tested board arrives exactly like this: oscillator running since the
+        // production line, stop flag clear, time a year stale.
+        Ok(t) if t < BUILD_UNIX => {
+            println!("rtc: time {t} predates this build, ignoring");
+            None
+        }
+        Ok(t) => {
+            println!("rtc: holding time, unix {t}");
+            Some(t)
+        }
+        Err(Error::Codec(codec::Error::ClockIntegrityLost)) => {
+            println!("rtc: oscillator stopped, time unknown until SNTP");
+            None
+        }
+        Err(e) => {
+            println!("rtc: unusable ({e:?})");
+            None
         }
     }
 }

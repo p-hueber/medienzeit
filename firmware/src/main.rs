@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod chime;
 mod fritzbox;
 mod net;
 mod panel;
@@ -84,7 +85,26 @@ async fn main(spawner: Spawner) {
 
     let mut i2c = rtc::bus(p.I2C0, p.GPIO47, p.GPIO48);
     rtc::scan(&mut i2c);
-    let mut clock = rtc::Rtc::new(i2c);
+
+    let mut chime = chime::Chime::new(
+        p.I2S0,
+        p.DMA_CH0,
+        chime::Pins {
+            mclk: p.GPIO14,
+            bclk: p.GPIO15,
+            lrclk: p.GPIO38,
+            dout: p.GPIO45,
+            pa_ctrl: p.GPIO46,
+        },
+        &mut i2c,
+    );
+
+    // One-shot at boot so the speaker path can be verified without waiting for a real
+    // five-minute warning. Total duration is compile-time bounded well under a second.
+    if let Some(c) = chime.as_mut() {
+        println!("chime: self-test");
+        c.warning();
+    }
 
     // Stand-in for the NFC reader until it arrives: BOOT toggles device 1's presence
     // at the reader, so the whole spend/block path can be exercised by hand.
@@ -100,7 +120,7 @@ async fn main(spawner: Spawner) {
     };
 
     let mut screen = Screen::default();
-    let mut now = clock.startup_time();
+    let mut now = rtc::startup_time(&mut i2c);
     if let Some(t) = now {
         let (snapshot, _) = ledger.tick(t, [true; 2], [false; 2], &policy);
         screen.draw(&mut panel, &snapshot);
@@ -131,10 +151,10 @@ async fn main(spawner: Spawner) {
 
     match net::sntp_once(stack, gateway).await {
         Ok(t) => {
-            if let Ok(before) = clock.now() {
+            if let Ok(before) = rtc::now(&mut i2c) {
                 println!("rtc: drift vs sntp {}s", t - before);
             }
-            match clock.set(t) {
+            match rtc::set(&mut i2c, t) {
                 Ok(()) => println!("rtc: set from sntp"),
                 Err(e) => println!("rtc: set failed ({e:?})"),
             }
@@ -194,7 +214,7 @@ async fn main(spawner: Spawner) {
     loop {
         // The RTC is authoritative between SNTP syncs, so a missed tick or a slow
         // network call cannot make the ledger lose time.
-        let t = clock.now().unwrap_or(state.last_tick + 1);
+        let t = rtc::now(&mut i2c).unwrap_or(state.last_tick + 1);
 
         let docked = [boot_button.is_high(), true];
         let (snapshot, events) = ledger.tick(t, docked, state.present, &policy);
@@ -202,6 +222,13 @@ async fn main(spawner: Spawner) {
 
         for e in &events {
             report(e);
+            // The chime exists for exactly one event. Everything else is on the
+            // display, where it can be read rather than interpreted.
+            if matches!(e, Event::Warning) {
+                if let Some(c) = chime.as_mut() {
+                    c.warning();
+                }
+            }
         }
 
         if last_presence.elapsed() >= PRESENCE_PERIOD {
