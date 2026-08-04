@@ -104,7 +104,7 @@ pub fn next_slot(newest_index: Option<usize>, total_slots: usize) -> usize {
 /// ahead of itself as it advances. Only true at a sector boundary, which is what keeps
 /// the wear spread out instead of hammering one sector.
 pub fn needs_erase(slot: usize, slots_per_sector: usize) -> bool {
-    slots_per_sector != 0 && slot % slots_per_sector == 0
+    slots_per_sector != 0 && slot.is_multiple_of(slots_per_sector)
 }
 
 /// A period during which the unit was not running.
