@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "ui", "sim", "tr064", "tr064-cli"]
+members = ["core", "ui", "sim", "tr064", "tr064-cli", "pn5180"]
 
 # `firmware/` is its own workspace: it targets xtensa-esp32s3-none-elf and needs a
 # different .cargo/config.toml and toolchain than everything above.
@@ -18,5 +18,6 @@ license = "MIT OR Apache-2.0"
 medienzeit-core = { path = "core" }
 medienzeit-ui = { path = "ui" }
 medienzeit-tr064 = { path = "tr064" }
+medienzeit-pn5180 = { path = "pn5180" }
 embedded-graphics = "0.8"
 heapless = "0.8"

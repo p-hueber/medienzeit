@@ -6,6 +6,7 @@ mod fritzbox;
 mod net;
 mod notify;
 mod panel;
+mod reader;
 mod rtc;
 mod storage;
 mod web;
@@ -110,6 +111,17 @@ async fn main(spawner: Spawner) {
     // Stand-in for the NFC reader until it arrives: BOOT toggles device 1's presence
     // at the reader, so the whole spend/block path can be exercised by hand.
     let boot_button = Input::new(p.GPIO0, InputConfig::default().with_pull(Pull::Up));
+
+    let mut nfc = reader::new(
+        p.SPI3,
+        reader::Pins {
+            sck: p.GPIO1,
+            mosi: p.GPIO3,
+            nss: p.GPIO2,
+            miso: p.GPIO44,
+        },
+    );
+    reader::identify(&mut nfc);
 
     let policy = Policy::default();
 

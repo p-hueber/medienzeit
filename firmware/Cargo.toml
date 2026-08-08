@@ -34,6 +34,7 @@ es8311 = "0.1"
 medienzeit-core = { path = "../core" }
 medienzeit-ui = { path = "../ui" }
 medienzeit-tr064 = { path = "../tr064" }
+medienzeit-pn5180 = { path = "../pn5180" }
 embedded-io-async = "0.6"
 embedded-tls = { version = "0.17", default-features = false }
 rand_core = { version = "0.6", default-features = false }

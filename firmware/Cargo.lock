@@ -1632,10 +1632,18 @@ dependencies = [
  "esp-storage",
  "heapless 0.8.0",
  "medienzeit-core",
+ "medienzeit-pn5180",
  "medienzeit-tr064",
  "medienzeit-ui",
  "rand_core 0.6.4",
  "static_cell",
+]
+
+[[package]]
+name = "medienzeit-pn5180"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
 ]
 
 [[package]]

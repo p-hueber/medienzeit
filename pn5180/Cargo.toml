@@ -1,0 +1,11 @@
+[package]
+name = "medienzeit-pn5180"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ISO 15693 reader driver, written from the NXP datasheet because no Rust one exists.
+# Generic over embedded-hal so it builds on the host and the target alike.
+
+[dependencies]
+embedded-hal = "1.0"
