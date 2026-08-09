@@ -183,6 +183,10 @@ pub fn identify(reader: &mut Reader<'static>) {
 /// then a measurement rather than a guess at the datasheet's bit map — and if no bit
 /// changes across `RF_ON`, the field never came up and no tag can possibly answer.
 pub fn start_rf(reader: &mut Reader<'static>) {
+    // Drop the field first, so TX_RFON_IRQ afterwards means something. RF_ON on a field
+    // that is already up raises no interrupt, which reads as a dead transmitter.
+    let _ = reader.field_off();
+    reader.delay_ms(20);
     let before = reader.read_register(medienzeit_pn5180::reg::RF_STATUS);
     if let Err(e) = reader.load_rf_config(0x0d, 0x8d) {
         println!("reader: load_rf_config failed ({e:?})");
@@ -401,4 +405,20 @@ pub fn rf_probe(reader: &mut Reader<'static>) {
     }
     let _ = reader.field_off();
     println!("reader: probe done");
+}
+
+/// Control experiment: does *any* card answer, in any protocol?
+///
+/// Runs before the ISO 15693 work so a silent inventory can be attributed correctly.
+/// A card that answers here is a 14443A part and will never appear in an ISO 15693
+/// inventory however well the reader works.
+pub fn probe_other_protocol(reader: &mut Reader<'static>) {
+    match reader.probe_iso14443a() {
+        Ok(Some(atqa)) => println!(
+            "reader: ISO 14443A card answered, ATQA {:02x}{:02x} — antenna and receive path work",
+            atqa[0], atqa[1]
+        ),
+        Ok(None) => println!("reader: no ISO 14443A answer either"),
+        Err(e) => println!("reader: 14443A probe failed ({e:?})"),
+    }
 }

@@ -126,7 +126,7 @@ async fn main(spawner: Spawner) {
     let mut scan = reader::Scan::default();
     // Probe first: it deliberately leaves the field off, so starting RF afterwards is
     // what actually arms the scan.
-    reader::rf_probe(&mut nfc);
+    reader::probe_other_protocol(&mut nfc);
     reader::start_rf(&mut nfc);
     reader::bringup_scan(&mut nfc, &mut scan, 45).await;
 

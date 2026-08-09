@@ -55,6 +55,10 @@ pub mod reg {
     pub const RX_STATUS: u8 = 0x13;
     /// Bits 26:24 are the transceive state.
     pub const RF_STATUS: u8 = 0x1d;
+    /// Bit 0 enables the receiver's CRC check.
+    pub const CRC_RX_CONFIG: u8 = 0x12;
+    /// Bit 0 enables the transmitter's CRC.
+    pub const CRC_TX_CONFIG: u8 = 0x19;
 }
 
 /// Transceive state meaning "ready for the host to hand over a frame".
@@ -367,11 +371,16 @@ where
     /// Transmit a frame. `data` may be empty, which sends a bare EOF — that is how
     /// ISO 15693 advances to the next anticollision slot.
     fn send_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.send_data_bits(data, 0)
+    }
+
+    /// As [`Self::send_data`], but with an explicit count of valid bits in the final
+    /// byte. ISO 14443A's short frames need 7, which is the only reason this exists.
+    fn send_data_bits(&mut self, data: &[u8], valid_bits: u8) -> Result<(), Error> {
         self.begin_transceive()?;
-        // Command, then "number of valid bits in the last byte", 0 meaning all eight.
         let mut frame = [0u8; 2 + MAX_FRAME];
         frame[0] = cmd::SEND_DATA;
-        frame[1] = 0x00;
+        frame[1] = valid_bits;
         frame[2..2 + data.len()].copy_from_slice(data);
         self.send(&frame[..2 + data.len()])
     }
@@ -436,6 +445,33 @@ where
                 }
                 Ok(len)
             }
+        }
+    }
+
+    /// Diagnostic only: send an ISO 14443A `REQA` and return the card's ATQA.
+    ///
+    /// This project needs ISO 15693 for its range, not 14443A. The value here is purely
+    /// as a control: a card answering `REQA` proves the antenna radiates and the receive
+    /// path works, which separates "the reader is broken" from "that tag speaks a
+    /// different protocol" — indistinguishable otherwise, since both are silence.
+    pub fn probe_iso14443a(&mut self) -> Result<Option<[u8; 2]>, Error> {
+        self.load_rf_config(0x00, 0x80)?;
+        self.field_on()?;
+        // The field needs time to ramp before a card can be powered up and answer.
+        self.delay.delay_us(20_000);
+        // REQA is a short frame: no CRC in either direction, and only 7 valid bits.
+        self.write_register_and_mask(reg::CRC_TX_CONFIG, 0xffff_fffe)?;
+        self.write_register_and_mask(reg::CRC_RX_CONFIG, 0xffff_fffe)?;
+        self.clear_irqs()?;
+        self.send_data_bits(&[0x26], 7)?;
+        match self.await_frame(20_000)? {
+            None => Ok(None),
+            Some(len) if len >= 2 => {
+                let mut atqa = [0u8; 2];
+                self.read_data(&mut atqa)?;
+                Ok(Some(atqa))
+            }
+            Some(_) => Ok(None),
         }
     }
 
