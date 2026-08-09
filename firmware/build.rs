@@ -119,6 +119,8 @@ fn main() {
     // the BOOT button so the spend path stays exercisable without them.
     let tags = std::fs::read_to_string("tags.toml").unwrap_or_default();
     let mut tag_uid = ["".to_string(), "".to_string()];
+    let mut card_uid = ["".to_string(), "".to_string()];
+    let mut protocol = "iso15693".to_string();
     for line in tags.lines() {
         let line = line.trim();
         if line.starts_with('#') {
@@ -129,11 +131,23 @@ fn main() {
         match k.trim() {
             "device1_uid" => tag_uid[0] = v,
             "device2_uid" => tag_uid[1] = v,
+            "device1_card_uid" => card_uid[0] = v,
+            "device2_card_uid" => card_uid[1] = v,
+            "protocol" => protocol = v,
             _ => {}
         }
     }
+    // One protocol at a time, chosen at build time. The PN5180 can do both, but not
+    // without reconfiguring the front end between polls, which cycles the field and
+    // wedges the transceiver. Nothing here needs both at once.
+    if protocol != "iso15693" && protocol != "iso14443a" {
+        panic!("firmware/tags.toml: protocol must be \"iso15693\" or \"iso14443a\", got {protocol:?}");
+    }
+    println!("cargo:rustc-env=MEDIENZEIT_PROTOCOL={protocol}");
     println!("cargo:rustc-env=MEDIENZEIT_TAG_DEVICE1={}", tag_uid[0]);
     println!("cargo:rustc-env=MEDIENZEIT_TAG_DEVICE2={}", tag_uid[1]);
+    println!("cargo:rustc-env=MEDIENZEIT_CARD_DEVICE1={}", card_uid[0]);
+    println!("cargo:rustc-env=MEDIENZEIT_CARD_DEVICE2={}", card_uid[1]);
 
     for key in [
         "user",

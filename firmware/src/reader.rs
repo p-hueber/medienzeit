@@ -52,7 +52,7 @@ use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
 use esp_println::{print, println};
-use medienzeit_pn5180::{Pn5180, Uid};
+use medienzeit_pn5180::{CardUid, Pn5180, Uid};
 
 /// Most tags we expect in the field at once. Two devices, plus slack so a stray tag
 /// shows up in the log rather than being silently dropped.
@@ -95,8 +95,7 @@ pub fn new(spi: esp_hal::peripherals::SPI3<'static>, pins: Pins) -> Reader<'stat
     // version came back 0xFFFF where every warm boot gave a real value. Harmless here
     // because the next read succeeds, but a first read that silently returns nonsense
     // is worth 50 ms to avoid.
-    let mut d = delay;
-    d.delay_millis(50);
+    delay.delay_millis(50);
     // No pull configured: the PN5180 drives BUSY actively in both directions, and a
     // pull-up here would make an unpowered module look permanently busy rather than
     // permanently idle — a timeout is a clearer failure than a hang.
@@ -191,7 +190,14 @@ pub fn identify(reader: &mut Reader<'static>) {
 /// Reports `RF_STATUS` either side of each step. Which bit means "transmitter on" is
 /// then a measurement rather than a guess at the datasheet's bit map — and if no bit
 /// changes across `RF_ON`, the field never came up and no tag can possibly answer.
-pub fn start_rf(reader: &mut Reader<'static>) {
+pub fn start_rf(reader: &mut Reader<'static>, cards: bool) {
+    if cards {
+        match reader.begin_iso14443a() {
+            Ok(()) => println!("reader: ISO 14443A field on"),
+            Err(e) => println!("reader: could not start ISO 14443A ({e:?})"),
+        }
+        return;
+    }
     // Drop the field first, so TX_RFON_IRQ afterwards means something. RF_ON on a field
     // that is already up raises no interrupt, which reads as a dead transmitter.
     let _ = reader.field_off();
@@ -342,9 +348,31 @@ impl Scan {
 /// the reader sits behind DHCP and SNTP, so a flaky association would otherwise mean the
 /// antenna is never even asked. Reader faults should not be diagnosed through the
 /// network's availability.
-pub async fn bringup_scan(reader: &mut Reader<'static>, scan: &mut Scan, secs: u32) {
+pub async fn bringup_scan(
+    reader: &mut Reader<'static>,
+    scan: &mut Scan,
+    secs: u32,
+    cards: bool,
+) {
     println!("reader: scanning for {secs}s — present a tag");
+    let mut last_card = None;
+    let mut tracker = CardTracker::default();
     for i in 0..secs {
+        if cards {
+            // Report card UIDs so they can be copied into tags.toml, debounced the same
+            // way the control loop does it — an unfiltered log would show flapping that
+            // the running system never sees.
+            let card = tracker.update(poll_card(reader).unwrap_or(None));
+            if card != last_card {
+                match card {
+                    Some(c) => println!("reader: card {}", card_hex(&c)),
+                    None => println!("reader: card gone"),
+                }
+                last_card = card;
+            }
+            embassy_time::Timer::after(embassy_time::Duration::from_secs(1)).await;
+            continue;
+        }
         scan.poll(reader);
         // Periodic register dump: with no tag answering, these three say whether the
         // transmitter is even reaching the right state, and whether anything was heard.
@@ -459,6 +487,8 @@ pub fn probe_other_protocol(reader: &mut Reader<'static>) {
 pub struct Docking {
     /// Configured UID per device; `None` means fall back to the BOOT button.
     known: [Option<Uid>; 2],
+    /// Configured ISO 14443A card per device, for the interim before stickers arrive.
+    known_cards: [Option<CardUid>; 2],
     last: [bool; 2],
     /// The unknown tag most recently reported, so one strange tag left lying on the
     /// reader does not produce an alert every second.
@@ -481,19 +511,35 @@ pub struct Docked {
 }
 
 impl Docking {
-    pub fn new(known: [Option<Uid>; 2]) -> Self {
+    pub fn new(known: [Option<Uid>; 2], known_cards: [Option<CardUid>; 2]) -> Self {
         // Start docked, matching the ledger's own fresh-state assumption: until
         // something is known, do not spend.
-        Self { known, last: [true; 2], reported_unknown: None, consecutive_failures: 0 }
+        Self {
+            known,
+            known_cards,
+            last: [true; 2],
+            reported_unknown: None,
+            consecutive_failures: 0,
+        }
     }
 
-    /// True when neither device has a configured tag, so the reader cannot yet drive
+    /// True when no device has any identity configured, so the reader cannot drive
     /// anything and the BOOT button is still the only input.
     pub fn unconfigured(&self) -> bool {
-        self.known.iter().all(|k| k.is_none())
+        self.known.iter().all(|k| k.is_none()) && self.known_cards.iter().all(|k| k.is_none())
     }
 
-    pub fn update(&mut self, seen: Option<&[Uid]>, fallback: [bool; 2]) -> Docked {
+    /// Whether a device is identified by a card rather than a sticker.
+    fn card_present(&self, i: usize, card: Option<CardUid>) -> Option<bool> {
+        self.known_cards[i].map(|known| card == Some(known))
+    }
+
+    pub fn update(
+        &mut self,
+        seen: Option<&[Uid]>,
+        card: Option<CardUid>,
+        fallback: [bool; 2],
+    ) -> Docked {
         let Some(seen) = seen else {
             self.consecutive_failures += 1;
             return Docked {
@@ -505,10 +551,17 @@ impl Docking {
         self.consecutive_failures = 0;
 
         let mut docked = [false; 2];
-        for (i, slot) in self.known.iter().enumerate() {
-            docked[i] = match slot {
-                Some(uid) => seen.contains(uid),
-                None => fallback[i],
+        for i in 0..2 {
+            // A sticker wins if one is configured; otherwise a card; otherwise the
+            // button. Both can be configured during the changeover, and either being
+            // present counts as put back — so swapping identities needs no flag day.
+            let by_tag = self.known[i].map(|uid| seen.contains(&uid));
+            let by_card = self.card_present(i, card);
+            docked[i] = match (by_tag, by_card) {
+                (Some(a), Some(b)) => a || b,
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (None, None) => fallback[i],
             };
         }
         self.last = docked;
@@ -536,4 +589,88 @@ pub fn uid_hex(uid: &Uid) -> heapless::String<16> {
         let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
     }
     s
+}
+
+/// Poll for a single ISO 14443A card. The front end must already be on that protocol.
+///
+/// Interim support while the ISO 15693 stickers are in the post: shorter range, and one
+/// card at a time, since there is no anticollision here. Two cards in the field collide
+/// and read as nothing, which is the safe way to fail — no identity rather than a wrong
+/// one.
+/// `None` means the reader failed; `Some(None)` means it worked and no card is there.
+///
+/// The distinction is the whole safety property. Collapsing the two lets a broken reader
+/// masquerade as "the card has been taken", which starts the clock and eventually cuts
+/// the internet on a device that never moved.
+pub fn poll_card(reader: &mut Reader<'static>) -> Option<Option<CardUid>> {
+    match reader.iso14443a_uid() {
+        Ok(u) => Some(u),
+        Err(e) => {
+            println!("reader: card poll failed ({e:?})");
+            None
+        }
+    }
+}
+
+/// Format a card UID for a message, most significant byte first.
+pub fn card_hex(uid: &CardUid) -> heapless::String<8> {
+    let mut s = heapless::String::new();
+    for b in uid.0 {
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
+    }
+    s
+}
+
+/// Debounces card reads.
+///
+/// Two failure modes seen on the bench, both of which would reach the ledger unfiltered:
+/// a card at the edge of the field drops out for single polls, which would toggle
+/// `docked` every second and flip the ledger between filling and draining; and a garbled
+/// frame occasionally passes the BCC, since that checksum is only eight bits and roughly
+/// one corrupt frame in 256 survives it. So a new identity has to appear twice in a row
+/// to be believed, and an absence has to persist before it counts.
+#[derive(Default)]
+pub struct CardTracker {
+    current: Option<CardUid>,
+    candidate: Option<CardUid>,
+    candidate_hits: u32,
+    misses: u32,
+}
+
+/// Consecutive identical reads before a *new* card is accepted.
+const CARD_CONFIRM: u32 = 2;
+/// Consecutive empty polls before a card counts as gone.
+const CARD_MISS_LIMIT: u32 = 3;
+
+impl CardTracker {
+    pub fn update(&mut self, raw: Option<CardUid>) -> Option<CardUid> {
+        match raw {
+            Some(u) => {
+                self.misses = 0;
+                if self.current == Some(u) {
+                    self.candidate = None;
+                    self.candidate_hits = 0;
+                } else if self.candidate == Some(u) {
+                    self.candidate_hits += 1;
+                    if self.candidate_hits >= CARD_CONFIRM {
+                        self.current = Some(u);
+                        self.candidate = None;
+                        self.candidate_hits = 0;
+                    }
+                } else {
+                    self.candidate = Some(u);
+                    self.candidate_hits = 1;
+                }
+            }
+            None => {
+                self.candidate = None;
+                self.candidate_hits = 0;
+                self.misses += 1;
+                if self.misses >= CARD_MISS_LIMIT {
+                    self.current = None;
+                }
+            }
+        }
+        self.current
+    }
 }

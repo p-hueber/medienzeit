@@ -124,14 +124,33 @@ async fn main(spawner: Spawner) {
     );
     reader::identify(&mut nfc);
     let mut scan = reader::Scan::default();
-    reader::start_rf(&mut nfc);
+    let cards = env!("MEDIENZEIT_PROTOCOL") == "iso14443a";
+    println!("reader: protocol {}", env!("MEDIENZEIT_PROTOCOL"));
+    reader::start_rf(&mut nfc, cards);
 
     // Tags are configured by UID in tags.toml. An unset value leaves that device on the
     // BOOT-button fallback, so the firmware is useful before the tags physically arrive.
-    let mut docking = reader::Docking::new([
-        medienzeit_pn5180::Uid::from_display_hex(env!("MEDIENZEIT_TAG_DEVICE1")),
-        medienzeit_pn5180::Uid::from_display_hex(env!("MEDIENZEIT_TAG_DEVICE2")),
-    ]);
+    let mut docking = reader::Docking::new(
+        [
+            medienzeit_pn5180::Uid::from_display_hex(env!("MEDIENZEIT_TAG_DEVICE1")),
+            medienzeit_pn5180::Uid::from_display_hex(env!("MEDIENZEIT_TAG_DEVICE2")),
+        ],
+        [
+            medienzeit_pn5180::CardUid::from_hex(env!("MEDIENZEIT_CARD_DEVICE1")),
+            medienzeit_pn5180::CardUid::from_hex(env!("MEDIENZEIT_CARD_DEVICE2")),
+        ],
+    );
+    for (i, raw) in [
+        env!("MEDIENZEIT_CARD_DEVICE1"),
+        env!("MEDIENZEIT_CARD_DEVICE2"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        if !raw.is_empty() && medienzeit_pn5180::CardUid::from_hex(raw).is_none() {
+            println!("reader: tags.toml device{} card UID {raw:?} is not valid", i + 1);
+        }
+    }
     for (i, raw) in [
         env!("MEDIENZEIT_TAG_DEVICE1"),
         env!("MEDIENZEIT_TAG_DEVICE2"),
@@ -145,11 +164,16 @@ async fn main(spawner: Spawner) {
             println!("reader: tags.toml device{} UID {raw:?} is not a valid UID", i + 1);
         }
     }
+    let mut card_tracker = reader::CardTracker::default();
+    // Matches Docking's own starting assumption, so the first real reading logs a
+    // transition only if it actually differs.
+    let mut last_docked = [true; 2];
+    let mut last_recoveries = 0;
     if docking.unconfigured() {
         println!("reader: no tag UIDs configured — using the BOOT button");
         // Only worth a scan window when there is nothing to match against: it is how the
         // UIDs get read off in the first place.
-        reader::bringup_scan(&mut nfc, &mut scan, 20).await;
+        reader::bringup_scan(&mut nfc, &mut scan, 20, cards).await;
     }
 
     let policy = Policy::default();
@@ -288,9 +312,41 @@ async fn main(spawner: Spawner) {
             println!("medienzeit: +{}s granted", secs);
         }
 
-        let seen = scan.poll(&mut nfc);
-        let d = docking.update(seen, [boot_button.is_high(), true]);
+        // One protocol per build; see tags.toml. A reader failure has to reach Docking
+        // as a failure in either protocol — `Some(&[])` would say "the reader is fine
+        // and nothing is there", which is what makes a broken reader start the clock.
+        let (seen, card) = if cards {
+            match reader::poll_card(&mut nfc) {
+                Some(raw) => (Some(&[][..]), card_tracker.update(raw)),
+                None => (None, None),
+            }
+        } else {
+            (scan.poll(&mut nfc), None)
+        };
+        let d = docking.update(seen, card, [boot_button.is_high(), true]);
         let docked = d.docked;
+        // Log the transition, not the state: at the balance cap, filling and held look
+        // identical in the numbers, so this is what shows identity actually driving the
+        // ledger.
+        // Surface RF recoveries: reads can keep succeeding while the front end is
+        // quietly having to be cycled, and a rising count is the early warning.
+        let r = nfc.recoveries();
+        if r != last_recoveries {
+            println!("reader: rf recoveries {r}");
+            last_recoveries = r;
+        }
+        if docked != last_docked {
+            for i in 0..2 {
+                if docked[i] != last_docked[i] {
+                    println!(
+                        "reader: {} {}",
+                        DEV_NAMES[i],
+                        if docked[i] { "zurückgelegt" } else { "genommen" }
+                    );
+                }
+            }
+            last_docked = docked;
+        }
         if let Some(uid) = d.unknown {
             let hex = reader::uid_hex(&uid);
             println!("  [alert] unknown tag {hex}");
