@@ -15,17 +15,15 @@
 //!    same way.
 //!
 //! Skipping step 3 reads back whatever was left in the chip's buffer, which looks like
-//! data and is not. Every wait here is bounded: this board ties RST high because there
-//! was no GPIO left for it, so a wedged chip cannot be hardware-reset and an unbounded
-//! wait would hang the firmware permanently.
+//! data and is not. Every wait here is bounded regardless, because an unbounded wait on
+//! a chip that has stopped answering hangs the firmware permanently — and the ledger
+//! stops ticking with it.
 //!
 //! # Running without BUSY
 //!
-//! The BUSY pin is optional here, and on this board it has to be: IO43 is the only
-//! remaining header pin and the ROM bootloader drives it at reset, so anything wired
-//! there stops the chip booting at all. Without BUSY the driver substitutes a fixed
-//! settling delay, which is strictly worse — it is a guess where the pin was a fact —
-//! and is the first thing to revisit if reads come back inconsistent.
+//! The BUSY pin is optional here, substituted by a fixed settling delay. That is
+//! strictly worse — a guess where the pin was a fact — and exists only as an escape
+//! hatch for a board that genuinely has no GPIO to spare. Wire BUSY if you can.
 
 #![no_std]
 
@@ -77,6 +75,13 @@ pub struct Pn5180<SPI, BUSY, D> {
     /// `None` when no BUSY pin is wired; see the module docs.
     busy: Option<BUSY>,
     delay: D,
+    /// Whether BUSY has ever been observed high.
+    ///
+    /// Bring-up diagnostic, and a sharp one: a chip that is unpowered, held in reset or
+    /// wired to the wrong pin holds BUSY low forever, which is indistinguishable from a
+    /// chip so fast we always miss the rise. If this is still false after a few
+    /// commands, the handshake is not happening and every read is fiction.
+    saw_busy_high: bool,
 }
 
 /// Settling time used in place of the BUSY handshake. Generous: the datasheet's
@@ -90,12 +95,23 @@ where
     D: DelayNs,
 {
     pub fn new(spi: SPI, busy: BUSY, delay: D) -> Self {
-        Self { spi, busy: Some(busy), delay }
+        Self { spi, busy: Some(busy), delay, saw_busy_high: false }
     }
 
     /// Construct without a BUSY line, substituting a fixed delay.
     pub fn without_busy(spi: SPI, delay: D) -> Self {
-        Self { spi, busy: None, delay }
+        Self { spi, busy: None, delay, saw_busy_high: false }
+    }
+
+    /// Has BUSY ever been seen high? See the field docs — false after several commands
+    /// means the chip is not acknowledging anything.
+    pub fn saw_busy_high(&self) -> bool {
+        self.saw_busy_high
+    }
+
+    /// Current BUSY level, or `None` if no BUSY pin is wired or it cannot be read.
+    pub fn busy_level(&mut self) -> Option<bool> {
+        self.busy.as_mut()?.is_high().ok()
     }
 
     /// Block until BUSY is low, or give up.
@@ -120,7 +136,10 @@ where
         let Some(busy) = self.busy.as_mut() else { return };
         for _ in 0..100 {
             match busy.is_high() {
-                Ok(true) => return,
+                Ok(true) => {
+                    self.saw_busy_high = true;
+                    return;
+                }
                 Ok(false) => self.delay.delay_us(10),
                 Err(_) => return,
             }

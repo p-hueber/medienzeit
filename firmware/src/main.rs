@@ -116,8 +116,9 @@ async fn main(spawner: Spawner) {
         p.SPI3,
         reader::Pins {
             sck: p.GPIO1,
-            mosi: p.GPIO3,
-            nss: p.GPIO2,
+            mosi: p.GPIO2,
+            rst: p.GPIO3,
+            nss: p.GPIO43,
             miso: p.GPIO44,
         },
     );
