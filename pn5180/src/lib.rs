@@ -66,6 +66,10 @@ const TS_WAIT_TRANSMIT: u32 = 1;
 /// Transceive state meaning the machine has finished and is doing nothing.
 const TS_IDLE: u32 = 0;
 
+/// Requests per poll before a card counts as absent. Cheap: each is a ~20 ms timeout,
+/// and only a genuinely absent card pays the full cost.
+const CARD_ATTEMPTS: u32 = 3;
+
 /// Extract the transceive state from `RF_STATUS`.
 pub fn transceive_state(rf_status: u32) -> u32 {
     (rf_status >> 24) & 0x07
@@ -659,22 +663,37 @@ where
     /// will collide and read as nothing, which is the safe way to fail: no identity
     /// rather than a wrong one.
     ///
-    /// Assumes [`Self::begin_iso14443a`] has already configured the front end.
+    /// Reconfigures the front end on every call, and uses `REQA` rather than `WUPA`.
+    ///
+    /// Both look wasteful and both are deliberate. This exact sequence read a card
+    /// reliably on the bench; replacing it with one-time setup plus `WUPA` — two changes
+    /// at once — wedged the transceiver on most polls and never recovered. Cycling the
+    /// field per poll evidently resets something that returning the command field to
+    /// Idle does not. Change one of these at a time, and verify against a real card.
     pub fn iso14443a_uid(&mut self) -> Result<Option<CardUid>, Error> {
-        if self.reqa_or_wupa(0x52)?.is_none() {
-            return Ok(None);
-        }
-        // ANTICOLLISION, cascade level 1: 0x93 0x20, no CRC, whole bytes.
-        self.clear_irqs()?;
-        self.send_data_bits(&[0x93, 0x20], 0)?;
-        match self.await_frame(20_000)? {
-            Some(len) if len >= 5 => {
-                let mut buf = [0u8; 5];
-                self.read_data(&mut buf)?;
-                Ok(parse_anticollision(&buf))
+        self.begin_iso14443a()?;
+        // Several attempts before concluding the card is gone. The field is cycled once
+        // per poll, so a card sitting perfectly still has to power up from cold every
+        // time, and it does not always make the first request. One attempt per poll made
+        // a stationary card appear to come and go.
+        for _ in 0..CARD_ATTEMPTS {
+            if self.reqa_or_wupa(0x26)?.is_none() {
+                continue;
             }
-            _ => Ok(None),
+            // ANTICOLLISION, cascade level 1: 0x93 0x20, no CRC, whole bytes.
+            self.clear_irqs()?;
+            self.send_data_bits(&[0x93, 0x20], 0)?;
+            if let Some(len) = self.await_frame(20_000)? {
+                if len >= 5 {
+                    let mut buf = [0u8; 5];
+                    self.read_data(&mut buf)?;
+                    if let Some(uid) = parse_anticollision(&buf) {
+                        return Ok(Some(uid));
+                    }
+                }
+            }
         }
+        Ok(None)
     }
 
     /// Run one 16-slot inventory round, collecting every tag that answers.

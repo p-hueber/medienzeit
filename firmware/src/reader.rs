@@ -640,7 +640,12 @@ pub struct CardTracker {
 /// Consecutive identical reads before a *new* card is accepted.
 const CARD_CONFIRM: u32 = 2;
 /// Consecutive empty polls before a card counts as gone.
-const CARD_MISS_LIMIT: u32 = 3;
+///
+/// Six rather than three: a card is re-powered from cold on every poll, so short dropouts
+/// are normal even when it has not moved. The cost of being generous is that a real
+/// pickup takes a few seconds to register, which is nothing against a budget measured in
+/// hours — where a false "taken" is visible immediately as the internet being cut.
+const CARD_MISS_LIMIT: u32 = 6;
 
 impl CardTracker {
     pub fn update(&mut self, raw: Option<CardUid>) -> Option<CardUid> {
