@@ -34,6 +34,7 @@ fn main() {
     println!("cargo:rerun-if-changed=fritzbox.toml");
     println!("cargo:rerun-if-changed=web.toml");
     println!("cargo:rerun-if-changed=ntfy.toml");
+    println!("cargo:rerun-if-changed=tags.toml");
     println!("cargo:rerun-if-changed=build.rs");
 
     let path = Path::new("wifi.toml");
@@ -112,6 +113,27 @@ fn main() {
         let v = require(&web, "web.toml", key);
         println!("cargo:rustc-env=MEDIENZEIT_WEB_{}={v}", key.to_uppercase());
     }
+
+    // Tag UIDs. Optional, and the only config file that is: the tags are a physical
+    // thing that can arrive after the firmware works, and an empty value falls back to
+    // the BOOT button so the spend path stays exercisable without them.
+    let tags = std::fs::read_to_string("tags.toml").unwrap_or_default();
+    let mut tag_uid = ["".to_string(), "".to_string()];
+    for line in tags.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let v = v.trim().trim_matches('"').to_string();
+        match k.trim() {
+            "device1_uid" => tag_uid[0] = v,
+            "device2_uid" => tag_uid[1] = v,
+            _ => {}
+        }
+    }
+    println!("cargo:rustc-env=MEDIENZEIT_TAG_DEVICE1={}", tag_uid[0]);
+    println!("cargo:rustc-env=MEDIENZEIT_TAG_DEVICE2={}", tag_uid[1]);
 
     for key in [
         "user",

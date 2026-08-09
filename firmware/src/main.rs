@@ -108,8 +108,8 @@ async fn main(spawner: Spawner) {
     );
 
 
-    // Stand-in for the NFC reader until it arrives: BOOT toggles device 1's presence
-    // at the reader, so the whole spend/block path can be exercised by hand.
+    // Fallback for any device with no tag configured yet: BOOT toggles device 1's
+    // presence at the reader, so the spend/block path stays exercisable by hand.
     let boot_button = Input::new(p.GPIO0, InputConfig::default().with_pull(Pull::Up));
 
     let mut nfc = reader::new(
@@ -124,11 +124,33 @@ async fn main(spawner: Spawner) {
     );
     reader::identify(&mut nfc);
     let mut scan = reader::Scan::default();
-    // Probe first: it deliberately leaves the field off, so starting RF afterwards is
-    // what actually arms the scan.
-    reader::probe_other_protocol(&mut nfc);
     reader::start_rf(&mut nfc);
-    reader::bringup_scan(&mut nfc, &mut scan, 45).await;
+
+    // Tags are configured by UID in tags.toml. An unset value leaves that device on the
+    // BOOT-button fallback, so the firmware is useful before the tags physically arrive.
+    let mut docking = reader::Docking::new([
+        medienzeit_pn5180::Uid::from_display_hex(env!("MEDIENZEIT_TAG_DEVICE1")),
+        medienzeit_pn5180::Uid::from_display_hex(env!("MEDIENZEIT_TAG_DEVICE2")),
+    ]);
+    for (i, raw) in [
+        env!("MEDIENZEIT_TAG_DEVICE1"),
+        env!("MEDIENZEIT_TAG_DEVICE2"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        // A malformed UID is not the same as an unset one, and silently falling back to
+        // the button would hide the typo behind a device whose clock never stops.
+        if !raw.is_empty() && medienzeit_pn5180::Uid::from_display_hex(raw).is_none() {
+            println!("reader: tags.toml device{} UID {raw:?} is not a valid UID", i + 1);
+        }
+    }
+    if docking.unconfigured() {
+        println!("reader: no tag UIDs configured — using the BOOT button");
+        // Only worth a scan window when there is nothing to match against: it is how the
+        // UIDs get read off in the first place.
+        reader::bringup_scan(&mut nfc, &mut scan, 20).await;
+    }
 
     let policy = Policy::default();
 
@@ -266,12 +288,22 @@ async fn main(spawner: Spawner) {
             println!("medienzeit: +{}s granted", secs);
         }
 
-        // Poll the field. The tag set is not yet wired to `docked` — that needs each
-        // device's UID configured, so until then this only reports what it sees and the
-        // BOOT button remains the stand-in.
-        scan.poll(&mut nfc);
-
-        let docked = [boot_button.is_high(), true];
+        let seen = scan.poll(&mut nfc);
+        let d = docking.update(seen, [boot_button.is_high(), true]);
+        let docked = d.docked;
+        if let Some(uid) = d.unknown {
+            let hex = reader::uid_hex(&uid);
+            println!("  [alert] unknown tag {hex}");
+            let mut m: notify::Message = heapless::String::new();
+            let _ = write!(m, "Unbekannter Tag {hex} am Leser");
+            notify::send(&m);
+        }
+        if d.reader_fault {
+            println!("  [alert] reader not responding");
+            let mut m: notify::Message = heapless::String::new();
+            let _ = write!(m, "Leser antwortet nicht");
+            notify::send(&m);
+        }
         let (snapshot, events) = ledger.tick(t, docked, state.present, &policy);
         state.last_tick = t;
 

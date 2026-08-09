@@ -90,6 +90,13 @@ pub fn new(spi: esp_hal::peripherals::SPI3<'static>, pins: Pins) -> Reader<'stat
     .with_miso(pins.miso);
 
     let dev = ExclusiveDevice::new(bus, nss, delay).expect("spi device");
+    // The ESP32 reaches this point faster than the PN5180 settles after power-up, and
+    // the first command then reads back all-ff. Observed on a cold boot: the product
+    // version came back 0xFFFF where every warm boot gave a real value. Harmless here
+    // because the next read succeeds, but a first read that silently returns nonsense
+    // is worth 50 ms to avoid.
+    let mut d = delay;
+    d.delay_millis(50);
     // No pull configured: the PN5180 drives BUSY actively in both directions, and a
     // pull-up here would make an unpowered module look permanently busy rather than
     // permanently idle — a timeout is a clearer failure than a hang.
@@ -121,7 +128,9 @@ pub fn identify(reader: &mut Reader<'static>) {
                     print!(" {b:02x}");
                 }
                 // Versions are stored minor-first; the die id is just 16 opaque bytes.
-                if len == 2 {
+                if buf.iter().all(|&b| b == 0xff) {
+                    print!("   <-- all ff: no answer, not a version");
+                } else if len == 2 {
                     print!("   = v{}.{}", buf[1], buf[0]);
                 }
                 println!();
@@ -234,6 +243,10 @@ pub fn start_rf(reader: &mut Reader<'static>) {
 /// A tag entering the field detunes and loads the antenna, which moves this number. It
 /// is the one check that works below the protocol: if AGC does not budge when a tag
 /// touches the coil, the two are not coupling and no amount of protocol work will help.
+///
+/// Kept though unreferenced: the only check that works below the protocol, for when a
+/// tag is present and nothing reads it.
+#[allow(dead_code)]
 pub async fn agc_watch(reader: &mut Reader<'static>, _secs: u32) {
     // Alternating narrated windows, so the log says what the coil was supposed to be
     // doing at each sample. Comparing a baseline against a known-loaded period is the
@@ -370,6 +383,11 @@ pub async fn bringup_scan(reader: &mut Reader<'static>, scan: &mut Scan, secs: u
 /// `RF_ON` with no configuration loaded separates "our RF config index is wrong" from
 /// "the transmitter is dead", and sweeping a few indices covers the possibility that
 /// this module's EEPROM lays them out differently from the datasheet's table.
+///
+/// Kept though unreferenced: this is the tool that showed the field does come up,
+/// after two wrong "the transmitter is dead" conclusions. Call it from `main` when RF
+/// misbehaves.
+#[allow(dead_code)]
 pub fn rf_probe(reader: &mut Reader<'static>) {
     // `None` means skip LOAD_RF_CONFIG entirely.
     let candidates: [(Option<(u8, u8)>, &str); 6] = [
@@ -412,6 +430,10 @@ pub fn rf_probe(reader: &mut Reader<'static>) {
 /// Runs before the ISO 15693 work so a silent inventory can be attributed correctly.
 /// A card that answers here is a 14443A part and will never appear in an ISO 15693
 /// inventory however well the reader works.
+///
+/// Kept though unreferenced: the control that distinguishes a broken reader from a tag
+/// speaking another protocol. Both are silence otherwise.
+#[allow(dead_code)]
 pub fn probe_other_protocol(reader: &mut Reader<'static>) {
     match reader.probe_iso14443a() {
         Ok(Some(atqa)) => println!(
@@ -421,4 +443,97 @@ pub fn probe_other_protocol(reader: &mut Reader<'static>) {
         Ok(None) => println!("reader: no ISO 14443A answer either"),
         Err(e) => println!("reader: 14443A probe failed ({e:?})"),
     }
+}
+
+/// Maps the tags in the field onto each device's `docked` flag.
+///
+/// # What happens when the reader fails
+///
+/// A reader that stops answering holds the **last known** docking state rather than
+/// guessing, and reports the fault. Both alternatives are worse: declaring everything
+/// undocked would drain the balance for devices sitting untouched at the reader, which
+/// is the unfairness this whole design exists to avoid; declaring everything docked
+/// would hand out unmetered screen time for as long as the fault lasts. Holding is
+/// wrong in neither direction for the length of a glitch, and the alert is what makes a
+/// long fault visible — detection over prevention, as everywhere else here.
+pub struct Docking {
+    /// Configured UID per device; `None` means fall back to the BOOT button.
+    known: [Option<Uid>; 2],
+    last: [bool; 2],
+    /// The unknown tag most recently reported, so one strange tag left lying on the
+    /// reader does not produce an alert every second.
+    reported_unknown: Option<Uid>,
+    consecutive_failures: u32,
+}
+
+/// Reader failures tolerated before saying so. At one poll per second this is a few
+/// seconds of silence, which distinguishes a wedged chip from a single bad transfer.
+const FAILURES_BEFORE_ALERT: u32 = 5;
+
+/// What a poll concluded.
+pub struct Docked {
+    pub docked: [bool; 2],
+    /// A tag in the field belonging to no configured device, worth telling the parent
+    /// about — a device carrying someone else's sticker looks exactly like this.
+    pub unknown: Option<Uid>,
+    /// The reader has been unresponsive long enough to be a fault, not a glitch.
+    pub reader_fault: bool,
+}
+
+impl Docking {
+    pub fn new(known: [Option<Uid>; 2]) -> Self {
+        // Start docked, matching the ledger's own fresh-state assumption: until
+        // something is known, do not spend.
+        Self { known, last: [true; 2], reported_unknown: None, consecutive_failures: 0 }
+    }
+
+    /// True when neither device has a configured tag, so the reader cannot yet drive
+    /// anything and the BOOT button is still the only input.
+    pub fn unconfigured(&self) -> bool {
+        self.known.iter().all(|k| k.is_none())
+    }
+
+    pub fn update(&mut self, seen: Option<&[Uid]>, fallback: [bool; 2]) -> Docked {
+        let Some(seen) = seen else {
+            self.consecutive_failures += 1;
+            return Docked {
+                docked: self.last,
+                unknown: None,
+                reader_fault: self.consecutive_failures == FAILURES_BEFORE_ALERT,
+            };
+        };
+        self.consecutive_failures = 0;
+
+        let mut docked = [false; 2];
+        for (i, slot) in self.known.iter().enumerate() {
+            docked[i] = match slot {
+                Some(uid) => seen.contains(uid),
+                None => fallback[i],
+            };
+        }
+        self.last = docked;
+
+        // Anything in the field that is not a configured device.
+        let unknown = seen
+            .iter()
+            .find(|u| !self.known.iter().any(|k| k.as_ref() == Some(*u)))
+            .copied();
+        let report = match (unknown, self.reported_unknown) {
+            (Some(u), Some(prev)) if u == prev => None,
+            (Some(u), _) => Some(u),
+            (None, _) => None,
+        };
+        self.reported_unknown = unknown;
+
+        Docked { docked, unknown: report, reader_fault: false }
+    }
+}
+
+/// Format a UID for a message, most significant byte first.
+pub fn uid_hex(uid: &Uid) -> heapless::String<16> {
+    let mut s = heapless::String::new();
+    for b in uid.display_order() {
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
+    }
+    s
 }

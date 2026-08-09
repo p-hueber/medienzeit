@@ -132,6 +132,42 @@ impl Uid {
     pub fn manufacturer(&self) -> u8 {
         self.0[6]
     }
+
+    /// Parse a UID written the way it is printed and quoted: most significant byte
+    /// first, starting `E0`. Separators (`:`, `-`, space) are ignored, case does not
+    /// matter.
+    ///
+    /// Rejects anything that is not a well-formed ISO 15693 UID rather than accepting it
+    /// quietly. A typo in configuration would otherwise produce a device that can never
+    /// be recognised, and the symptom — the clock always running — would look like a
+    /// hardware fault rather than a wrong character.
+    pub fn from_display_hex(s: &str) -> Option<Self> {
+        let mut bytes = [0u8; 8];
+        let mut n = 0;
+        let mut hi: Option<u8> = None;
+        for c in s.chars() {
+            if matches!(c, ':' | '-' | ' ' | '_') {
+                continue;
+            }
+            let d = c.to_digit(16)? as u8;
+            match hi {
+                None => hi = Some(d),
+                Some(h) => {
+                    if n == 8 {
+                        return None;
+                    }
+                    bytes[n] = (h << 4) | d;
+                    n += 1;
+                    hi = None;
+                }
+            }
+        }
+        if n != 8 || hi.is_some() || bytes[0] != 0xe0 {
+            return None;
+        }
+        bytes.reverse();
+        Some(Uid(bytes))
+    }
 }
 
 /// Decode an inventory response: flags, DSFID, then eight UID bytes.
@@ -578,6 +614,67 @@ mod tests {
         let mut shifted = [0u8; 10];
         shifted[..9].copy_from_slice(&slix()[1..]);
         assert_eq!(parse_inventory_response(&shifted), None);
+    }
+
+
+    #[test]
+    fn parses_a_printed_uid() {
+        let uid = Uid::from_display_hex("E004010203040506").expect("valid");
+        assert_eq!(uid.display_order(), [0xe0, 0x04, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+        assert_eq!(uid.manufacturer(), 0x04);
+    }
+
+    #[test]
+    fn parsing_ignores_separators_and_case() {
+        let a = Uid::from_display_hex("E004010203040506").unwrap();
+        for s in [
+            "e0:04:01:02:03:04:05:06",
+            "E0-04-01-02-03-04-05-06",
+            "e0 04 01 02 03 04 05 06",
+            "E0_04_01_02_03_04_05_06",
+        ] {
+            assert_eq!(Uid::from_display_hex(s), Some(a), "{s}");
+        }
+    }
+
+    #[test]
+    fn parsing_rejects_malformed_input() {
+        for s in [
+            "",                          // empty
+            "E00401020304",              // too short
+            "E0040102030405060708",      // too long
+            "E00401020304050",           // odd digit count
+            "E004010203040g06",          // not hex
+            "12004010203040506",         // does not start E0
+            "1004010203040506",          // wrong manufacturer prefix
+        ] {
+            assert_eq!(Uid::from_display_hex(s), None, "{s:?} should be rejected");
+        }
+    }
+
+    /// Parsing and display must be exact inverses, or a UID configured from a log line
+    /// would not match the tag it was copied from.
+    #[test]
+    fn parse_and_display_round_trip() {
+        let uid = parse_inventory_response(&slix()).unwrap();
+        let mut text = hex16(&uid.display_order());
+        let lower = core::str::from_utf8(&text).unwrap();
+        assert_eq!(Uid::from_display_hex(lower), Some(uid));
+        text.make_ascii_uppercase();
+        let upper = core::str::from_utf8(&text).unwrap();
+        assert_eq!(Uid::from_display_hex(upper), Some(uid));
+    }
+
+    /// Lowercase hex of eight bytes, without `std` — this crate is `no_std` even in
+    /// its tests.
+    fn hex16(bytes: &[u8; 8]) -> [u8; 16] {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut out = [0u8; 16];
+        for (i, b) in bytes.iter().enumerate() {
+            out[i * 2] = DIGITS[(b >> 4) as usize];
+            out[i * 2 + 1] = DIGITS[(b & 0x0f) as usize];
+        }
+        out
     }
 
     #[test]
