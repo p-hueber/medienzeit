@@ -117,12 +117,18 @@ async fn main(spawner: Spawner) {
         reader::Pins {
             sck: p.GPIO1,
             mosi: p.GPIO2,
-            rst: p.GPIO3,
+            busy: p.GPIO3,
             nss: p.GPIO43,
             miso: p.GPIO44,
         },
     );
     reader::identify(&mut nfc);
+    let mut scan = reader::Scan::default();
+    // Probe first: it deliberately leaves the field off, so starting RF afterwards is
+    // what actually arms the scan.
+    reader::rf_probe(&mut nfc);
+    reader::start_rf(&mut nfc);
+    reader::bringup_scan(&mut nfc, &mut scan, 45).await;
 
     let policy = Policy::default();
 
@@ -259,6 +265,11 @@ async fn main(spawner: Spawner) {
             ledger.grant_bonus(secs, &policy);
             println!("medienzeit: +{}s granted", secs);
         }
+
+        // Poll the field. The tag set is not yet wired to `docked` — that needs each
+        // device's UID configured, so until then this only reports what it sees and the
+        // BOOT button remains the stand-in.
+        scan.poll(&mut nfc);
 
         let docked = [boot_button.is_high(), true];
         let (snapshot, events) = ledger.tick(t, docked, state.present, &policy);

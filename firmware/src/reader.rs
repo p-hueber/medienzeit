@@ -7,28 +7,22 @@
 //!
 //! | PN5180 | wire | header | GPIO |
 //! |---|---|---|---|
-//! | 5V | | `VSYS` | — (measured 5 V on USB power) |
-//! | RST | | `3V3` | — (tied high; no GPIO left for a real reset) |
-//!
-//! During bring-up the module is instead fed 3.3 V from an external supply on its pin 2,
-//! bypassing the onboard LDO, with RST tied to that same rail and grounds commoned. That
-//! is enough for everything up to and including `identify`, which only reads EEPROM over
-//! SPI — the RF stage is never energised. Move to `VSYS` before measuring read range,
-//! because field strength is exactly what the 5 V rail buys.
+//! | 5V (pin 1) | | `VSYS` | — (measured 5 V on USB power) |
+//! | 3.3V (pin 2) | | `3V3` | — |
+//! | RST (pin 3) | | bridged to pin 2 | — (tied high; no GPIO left for a real reset) |
 //! | NSS | white | `TXD` | IO43 |
 //! | MOSI | grey | `GP2` | IO2 |
 //! | MISO | purple | `RXD` | IO44 |
 //! | SCK | blue | `GP1` | IO1 |
-//! | RST | green | `GP3` | IO3 |
-//! | BUSY | | *not connected* | — |
+//! | BUSY | green | `GP3` | IO3 |
 //! | GND | yellow | `GND` | — |
 //!
-//! **This module has no pull-up on RESET_N** — measured 0 V with pin 3 floating — so it
-//! cannot simply be left open, and it held the chip in permanent reset until the green
-//! wire moved onto it from BUSY. Only five header GPIO exist for six module signals, so
-//! one of RST and BUSY has to give. RST wins for now because a chip in reset cannot
-//! answer at all, whereas BUSY degrades to a fixed settling delay. The proper fix is to
-//! tie RST to the `3V3` header pin and give BUSY back its GPIO.
+//! **This module has no pull-up on RESET_N** — measured 0 V with pin 3 floating — so RST
+//! cannot be left open; it held the chip in permanent reset, answering every command
+//! with zeros, until it was tied high. Bridging it to the module's own 3.3 V input
+//! (pin 2 → header `3V3`) keeps all five header GPIO available for signals, which is
+//! what lets BUSY stay wired. Do not "free" that bridge to save a jumper: the fallback
+//! is a fixed settling delay, and RF transactions take variable time.
 //!
 //! **Read the header off the PCB, never off the sticker on the case.** That sticker's
 //! block diagram is printed 180° out, and every pin identified from it during bring-up
@@ -45,51 +39,40 @@
 //! that appeared around 0x5b–0x60 while the RTC vanished were SPI traffic landing on
 //! `SDA`/`SCL`.
 //!
-//! Pin 2 (3.3V) is deliberately unconnected — the module regulates 5 V down itself, and
-//! feeding both rails fights the onboard LDO. Running from 5 V rather than bypassing it
-//! is what gives the RF stage its full field strength, and therefore the range figure
-//! M0 is meant to measure.
+//! **This breakout has no onboard regulator**, so both rails are required: 5 V feeds the
+//! RF transmitter, 3.3 V the digital core and the SPI level shifters. Established by
+//! measurement — 5 V present on pin 1 left pin 2 at nothing, where an LDO would have put
+//! 3.3 V there. With only 3.3 V applied the chip answers but the shifters stay dark; with
+//! only 5 V nothing works at all.
 
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::delay::Delay;
-use esp_hal::gpio::{Input, Level, Output, OutputConfig};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
 use esp_println::{print, println};
-use medienzeit_pn5180::Pn5180;
+use medienzeit_pn5180::{Pn5180, Uid};
+
+/// Most tags we expect in the field at once. Two devices, plus slack so a stray tag
+/// shows up in the log rather than being silently dropped.
+pub const MAX_TAGS: usize = 4;
 
 type ReaderSpi<'d> = ExclusiveDevice<Spi<'d, esp_hal::Blocking>, Output<'d>, Delay>;
-/// `Input` only names the (unused) BUSY type parameter; no BUSY pin is wired.
 pub type Reader<'d> = Pn5180<ReaderSpi<'d>, Input<'d>, Delay>;
 
 pub struct Pins {
     pub sck: esp_hal::peripherals::GPIO1<'static>,
     pub mosi: esp_hal::peripherals::GPIO2<'static>,
-    /// RESET_N, active low. IO3 is a strapping pin (JTAG select) latched at reset before
-    /// firmware runs; we use USB-Serial-JTAG, so driving it afterwards is harmless.
-    pub rst: esp_hal::peripherals::GPIO3<'static>,
+    /// IO3 is a strapping pin (JTAG select), latched at reset before firmware runs. We
+    /// use USB-Serial-JTAG, so BUSY's level here is cosmetic at worst.
+    pub busy: esp_hal::peripherals::GPIO3<'static>,
     pub nss: esp_hal::peripherals::GPIO43<'static>,
     pub miso: esp_hal::peripherals::GPIO44<'static>,
 }
 
 pub fn new(spi: esp_hal::peripherals::SPI3<'static>, pins: Pins) -> Reader<'static> {
-    let mut delay = Delay::new();
-
-    // The module has no pull-up on RESET_N — measured 0 V floating — so without this the
-    // chip sits in reset forever, answering every command with zeros and never raising
-    // BUSY. Pulse it low, then hold high for the rest of the run.
-    let mut rst = Output::new(pins.rst, Level::High, OutputConfig::default());
-    delay.delay_millis(1);
-    rst.set_low();
-    delay.delay_millis(1);
-    rst.set_high();
-    // The datasheet wants a few hundred microseconds before the first command; 10 ms is
-    // free at boot and removes the question.
-    delay.delay_millis(10);
-    // Held high for the lifetime of the program. Dropping this would release the pin and
-    // put the chip straight back into reset.
-    core::mem::forget(rst);
+    let delay = Delay::new();
 
     let nss = Output::new(pins.nss, Level::High, OutputConfig::default());
 
@@ -107,7 +90,11 @@ pub fn new(spi: esp_hal::peripherals::SPI3<'static>, pins: Pins) -> Reader<'stat
     .with_miso(pins.miso);
 
     let dev = ExclusiveDevice::new(bus, nss, delay).expect("spi device");
-    Pn5180::without_busy(dev, delay)
+    // No pull configured: the PN5180 drives BUSY actively in both directions, and a
+    // pull-up here would make an unpowered module look permanently busy rather than
+    // permanently idle — a timeout is a clearer failure than a hang.
+    let busy = Input::new(pins.busy, InputConfig::default());
+    Pn5180::new(dev, busy, delay)
 }
 
 /// Ask the chip who it is. Proves wiring, SPI framing and the BUSY handshake before
@@ -148,17 +135,12 @@ pub fn identify(reader: &mut Reader<'static>) {
         (true, false) => println!("reader: BUSY never went high — no acknowledgement"),
     }
 
-    // Without BUSY the only evidence that a read landed on the right beat is that it
-    // lands the same way twice. Identical repeats do not prove correct framing, but a
-    // mismatch proves it is wrong — and that is the failure worth catching, because a
-    // response read one beat early still looks like a plausible version number.
-    // The decisive framing test. Repeats agreeing only shows we are consistently wrong
-    // or consistently right; a value we chose ourselves surviving a write/read round
-    // trip can only happen if both directions are framed correctly. TIMER1_RELOAD is a
-    // 24-bit scratch register that nothing else here uses.
-    // Measure the writable width rather than assuming it: all-ones reads back as the
-    // mask of bits that actually exist, and a pattern inside that mask must then survive
-    // exactly. Anything else — a shifted or garbled value — is a framing fault.
+    // The decisive framing test: a value we chose ourselves surviving a write/read round
+    // trip can only happen if both directions are framed correctly, where agreeing
+    // repeats would only show we are consistently wrong or consistently right. Measure
+    // the writable width rather than assume it — all-ones reads back as the mask of bits
+    // that actually exist (20 here, not the 24 the name suggests), and a pattern inside
+    // that mask must then survive exactly. TIMER1_RELOAD is scratch; nothing else uses it.
     const TIMER1_RELOAD: u8 = 0x0c;
     let probe = |reader: &mut Reader<'static>, v: u32| {
         reader
@@ -193,4 +175,230 @@ pub fn identify(reader: &mut Reader<'static>) {
         }
         println!();
     }
+}
+
+/// Configure the RF front end and switch the field on.
+///
+/// Reports `RF_STATUS` either side of each step. Which bit means "transmitter on" is
+/// then a measurement rather than a guess at the datasheet's bit map — and if no bit
+/// changes across `RF_ON`, the field never came up and no tag can possibly answer.
+pub fn start_rf(reader: &mut Reader<'static>) {
+    let before = reader.read_register(medienzeit_pn5180::reg::RF_STATUS);
+    if let Err(e) = reader.load_rf_config(0x0d, 0x8d) {
+        println!("reader: load_rf_config failed ({e:?})");
+        return;
+    }
+    let configured = reader.read_register(medienzeit_pn5180::reg::RF_STATUS);
+    // Ask the chip directly instead of interpreting RF_STATUS: TX_RFON_IRQ is raised by
+    // the transmitter actually coming up, so clearing first makes the reading after
+    // unambiguous.
+    let _ = reader.clear_all_irqs();
+    if let Err(e) = reader.field_on() {
+        println!("reader: field_on failed ({e:?})");
+        return;
+    }
+    // The field takes time to ramp, and TX_RFON_IRQ is raised when it has. Reading
+    // IRQ_STATUS immediately reports zero and looks exactly like a dead transmitter —
+    // which is precisely the wrong conclusion this delay exists to prevent.
+    reader.delay_ms(20);
+    let after = reader.read_register(medienzeit_pn5180::reg::RF_STATUS);
+    match reader.read_register(medienzeit_pn5180::reg::IRQ_STATUS) {
+        // Bit 9 is TX_RFON_IRQ on this part — established by probing, not from the
+        // datasheet's table.
+        Ok(irq) => println!(
+            "reader: irq after RF_ON = {irq:#010x} -> field {}",
+            if irq & (1 << 9) != 0 { "CAME UP" } else { "did NOT come up" }
+        ),
+        Err(e) => println!("reader: irq read failed ({e:?})"),
+    }
+    match (before, configured, after) {
+        (Ok(b), Ok(c), Ok(a)) => {
+            println!("reader: rf_status idle={b:#010x} configured={c:#010x} field_on={a:#010x}");
+            let changed = c ^ a;
+            if changed == 0 {
+                println!("reader: RF_ON changed nothing — the transmitter did not come up");
+            } else {
+                println!("reader: RF_ON toggled {changed:#010x}");
+            }
+        }
+        _ => println!("reader: rf_status read failed"),
+    }
+}
+
+/// Print the antenna's AGC reading so field loading can be watched by hand.
+///
+/// A tag entering the field detunes and loads the antenna, which moves this number. It
+/// is the one check that works below the protocol: if AGC does not budge when a tag
+/// touches the coil, the two are not coupling and no amount of protocol work will help.
+pub async fn agc_watch(reader: &mut Reader<'static>, _secs: u32) {
+    // Alternating narrated windows, so the log says what the coil was supposed to be
+    // doing at each sample. Comparing a baseline against a known-loaded period is the
+    // whole point; an unlabelled stream of numbers cannot be read after the fact.
+    const WINDOW_S: u32 = 8;
+    let mut bare = (u32::MAX, 0u32);
+    let mut loaded = (u32::MAX, 0u32);
+    for round in 0..4 {
+        let tag_on = round % 2 == 1;
+        println!(
+            "reader: >>> {} for {WINDOW_S}s",
+            if tag_on { "TAG ON the coil" } else { "TAG OFF, nothing near" }
+        );
+        for _ in 0..WINDOW_S * 2 {
+            if let Ok(rf) = reader.read_register(medienzeit_pn5180::reg::RF_STATUS) {
+                let agc = rf & 0x3ff;
+                let acc = if tag_on { &mut loaded } else { &mut bare };
+                acc.0 = acc.0.min(agc);
+                acc.1 = acc.1.max(agc);
+            }
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
+        }
+    }
+    println!("reader: agc bare {}..{}  loaded {}..{}", bare.0, bare.1, loaded.0, loaded.1);
+    if loaded.0 == u32::MAX || bare.0 == u32::MAX {
+        println!("reader: agc never read");
+    } else if loaded.1 > bare.1 + 5 || loaded.0 + 5 < bare.0 {
+        println!("reader: the tag loads the antenna — they are coupling");
+    } else {
+        println!("reader: no measurable loading — field and tag are not coupling");
+    }
+}
+
+/// Tracks which tags are present, and reports only when that changes.
+///
+/// Printing every poll would bury the transitions that matter in a wall of identical
+/// lines, and the transitions are the whole signal during bring-up.
+#[derive(Default)]
+pub struct Scan {
+    tags: [Uid; MAX_TAGS],
+    n: usize,
+    /// Consecutive polls in which a previously-seen tag did not answer.
+    misses: u32,
+}
+
+/// Misses tolerated before believing a tag has really gone.
+///
+/// A single dropped read is routine — the tag is passive and at the edge of the field —
+/// and treating one as a departure would start the clock every few seconds while the
+/// device sits untouched.
+const MISS_LIMIT: u32 = 3;
+
+impl Scan {
+    /// Poll once. Returns the current tag set, or `None` if the reader errored.
+    pub fn poll(&mut self, reader: &mut Reader<'static>) -> Option<&[Uid]> {
+        let mut found = [Uid::default(); MAX_TAGS];
+        let n = match reader.inventory(&mut found) {
+            Ok(n) => n,
+            Err(e) => {
+                println!("reader: inventory failed ({e:?})");
+                return None;
+            }
+        };
+
+        let same = n == self.n && found[..n].iter().all(|u| self.tags[..self.n].contains(u));
+        if same {
+            self.misses = 0;
+        } else if n < self.n && self.misses < MISS_LIMIT {
+            // Fewer tags than last time: hold the old set until it repeats, so one
+            // glitchy read cannot look like a device being picked up.
+            self.misses += 1;
+            return Some(&self.tags[..self.n]);
+        } else {
+            self.misses = 0;
+            self.tags = found;
+            self.n = n;
+            print!("reader: {n} tag(s)");
+            for uid in &found[..n] {
+                print!(" ");
+                for b in uid.display_order() {
+                    print!("{b:02x}");
+                }
+            }
+            println!();
+        }
+        Some(&self.tags[..self.n])
+    }
+}
+
+/// Poll the field for a while, reporting changes, before the network comes up.
+///
+/// Bring-up only, and deliberately ahead of Wi-Fi: the control loop that normally polls
+/// the reader sits behind DHCP and SNTP, so a flaky association would otherwise mean the
+/// antenna is never even asked. Reader faults should not be diagnosed through the
+/// network's availability.
+pub async fn bringup_scan(reader: &mut Reader<'static>, scan: &mut Scan, secs: u32) {
+    println!("reader: scanning for {secs}s — present a tag");
+    for i in 0..secs {
+        scan.poll(reader);
+        // Periodic register dump: with no tag answering, these three say whether the
+        // transmitter is even reaching the right state, and whether anything was heard.
+        // Alternate the data rate: some ICODE tags answer far more reliably at the low
+        // rate, and trying only one would leave that untested.
+        let high = i % 2 == 0;
+        let mut raw = [0u8; 32];
+        match reader.inventory_single_raw(&mut raw, high) {
+            Ok(0) => {}
+            Ok(n) => {
+                print!("reader: single-slot ({}) rx {n}:", if high { "high" } else { "low" });
+                for b in &raw[..n] {
+                    print!(" {b:02x}");
+                }
+                println!();
+            }
+            Err(e) => println!("reader: single-slot failed ({e:?})"),
+        }
+        if i % 10 == 0 {
+            match reader.rf_debug() {
+                Ok((rf, irq, rx)) => println!(
+                    "reader: rf={rf:#010x} (state {}) irq={irq:#010x} rx={rx:#010x}",
+                    medienzeit_pn5180::transceive_state(rf)
+                ),
+                Err(e) => println!("reader: rf_debug failed ({e:?})"),
+            }
+        }
+        embassy_time::Timer::after(embassy_time::Duration::from_secs(1)).await;
+    }
+    println!("reader: scan window over");
+}
+
+/// Try to bring the transmitter up several different ways, reporting what each does.
+///
+/// The question this answers is narrow: does `RF_ON` ever raise an interrupt? A bare
+/// `RF_ON` with no configuration loaded separates "our RF config index is wrong" from
+/// "the transmitter is dead", and sweeping a few indices covers the possibility that
+/// this module's EEPROM lays them out differently from the datasheet's table.
+pub fn rf_probe(reader: &mut Reader<'static>) {
+    // `None` means skip LOAD_RF_CONFIG entirely.
+    let candidates: [(Option<(u8, u8)>, &str); 6] = [
+        (None, "no config at all"),
+        (Some((0x0d, 0x8d)), "ISO 15693 ASK100 26k"),
+        (Some((0x0c, 0x8c)), "neighbouring index"),
+        (Some((0x0e, 0x8e)), "neighbouring index"),
+        (Some((0x00, 0x80)), "ISO 14443A 106k"),
+        (Some((0x0d, 0x8c)), "mismatched tx/rx"),
+    ];
+
+    for (cfg, what) in candidates {
+        let _ = reader.field_off();
+        reader.delay_ms(20);
+        let loaded = match cfg {
+            None => Ok(()),
+            Some((tx, rx)) => reader.load_rf_config(tx, rx),
+        };
+        let _ = reader.clear_all_irqs();
+        let on = reader.field_on();
+        reader.delay_ms(20);
+        let irq = reader.read_register(medienzeit_pn5180::reg::IRQ_STATUS);
+        let rf = reader.read_register(medienzeit_pn5180::reg::RF_STATUS);
+        match (loaded, on, irq, rf) {
+            (Ok(()), Ok(()), Ok(i), Ok(r)) => println!(
+                "reader: probe {what:22} irq={i:#010x} rf={r:#010x} {}",
+                if i != 0 { "<-- SOMETHING HAPPENED" } else { "" }
+            ),
+            (l, o, i, r) => {
+                println!("reader: probe {what:22} load={l:?} on={o:?} irq={i:?} rf={r:?}")
+            }
+        }
+    }
+    let _ = reader.field_off();
+    println!("reader: probe done");
 }

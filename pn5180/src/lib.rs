@@ -34,9 +34,41 @@ use embedded_hal::spi::SpiDevice;
 /// Direct commands, from the datasheet's instruction set.
 mod cmd {
     pub const WRITE_REGISTER: u8 = 0x00;
+    pub const WRITE_REGISTER_OR_MASK: u8 = 0x01;
+    pub const WRITE_REGISTER_AND_MASK: u8 = 0x02;
     pub const READ_REGISTER: u8 = 0x04;
     pub const READ_EEPROM: u8 = 0x07;
+    pub const SEND_DATA: u8 = 0x09;
+    pub const READ_DATA: u8 = 0x0a;
+    pub const LOAD_RF_CONFIG: u8 = 0x11;
+    pub const RF_ON: u8 = 0x16;
+    pub const RF_OFF: u8 = 0x17;
 }
+
+/// Registers we touch.
+pub mod reg {
+    /// Bits 2:0 select the transceive command.
+    pub const SYSTEM_CONFIG: u8 = 0x00;
+    pub const IRQ_STATUS: u8 = 0x02;
+    pub const IRQ_CLEAR: u8 = 0x03;
+    /// Bits 8:0 are the number of bytes received.
+    pub const RX_STATUS: u8 = 0x13;
+    /// Bits 26:24 are the transceive state.
+    pub const RF_STATUS: u8 = 0x1d;
+}
+
+/// Transceive state meaning "ready for the host to hand over a frame".
+const TS_WAIT_TRANSMIT: u32 = 1;
+
+/// Extract the transceive state from `RF_STATUS`.
+pub fn transceive_state(rf_status: u32) -> u32 {
+    (rf_status >> 24) & 0x07
+}
+
+/// `IRQ_STATUS` bit for "a frame has been received".
+const RX_IRQ: u32 = 1 << 0;
+/// Every IRQ bit, for clearing.
+const ALL_IRQS: u32 = 0x000f_ffff;
 
 /// EEPROM addresses worth reading.
 pub mod eeprom {
@@ -68,6 +100,59 @@ pub enum Error {
     /// A response that cannot be right — all ones is what an absent or unpowered chip
     /// reads back.
     NoResponse,
+    /// The chip reported more received bytes than the caller's buffer can hold.
+    Overflow,
+    /// The transceiver never reached WaitTransmit, so a frame could not be handed over.
+    NotReadyToTransmit,
+}
+
+/// An ISO 15693 unique identifier, in transmission order (least significant byte first,
+/// which is how the tag sends it).
+///
+/// Kept in wire order deliberately: the display order everyone quotes is the reverse,
+/// and converting once at the edge is less error-prone than two representations that
+/// look alike. Use [`Uid::display_order`] when showing it to a human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Uid(pub [u8; 8]);
+
+impl Uid {
+    /// Most-significant byte first, as printed on datasheets and tag labels. ISO 15693
+    /// UIDs always start `E0` in this order.
+    pub fn display_order(&self) -> [u8; 8] {
+        let mut out = self.0;
+        out.reverse();
+        out
+    }
+
+    /// The manufacturer byte — `0x04` for NXP, i.e. ICODE.
+    pub fn manufacturer(&self) -> u8 {
+        self.0[6]
+    }
+}
+
+/// Decode an inventory response: flags, DSFID, then eight UID bytes.
+///
+/// Pure so it can be tested on the host, which matters more than it looks — this is the
+/// step where a length or ordering mistake produces a UID that is stable, plausible and
+/// wrong, and a wrong-but-stable UID would silently identify the wrong device forever.
+pub fn parse_inventory_response(buf: &[u8]) -> Option<Uid> {
+    // flags(1) + DSFID(1) + UID(8). The CRC is checked and stripped by the PN5180.
+    if buf.len() < 10 {
+        return None;
+    }
+    // Bit 0 of the response flags is the error flag; a tag reporting an error has not
+    // given us a usable identity.
+    if buf[0] & 0x01 != 0 {
+        return None;
+    }
+    let mut uid = [0u8; 8];
+    uid.copy_from_slice(&buf[2..10]);
+    // Every ISO 15693 UID begins 0xE0 in display order, i.e. the last wire byte. This
+    // rejects framing slips that would otherwise look like a valid tag.
+    if uid[7] != 0xe0 {
+        return None;
+    }
+    Some(Uid(uid))
 }
 
 pub struct Pn5180<SPI, BUSY, D> {
@@ -207,5 +292,264 @@ where
     /// 16-byte die identifier, unique per chip.
     pub fn die_id(&mut self, buf: &mut [u8; 16]) -> Result<(), Error> {
         self.read_eeprom(eeprom::DIE_IDENTIFIER, buf)
+    }
+
+    // --- ISO 15693 ------------------------------------------------------------------
+
+    pub fn write_register_or_mask(&mut self, reg: u8, mask: u32) -> Result<(), Error> {
+        let m = mask.to_le_bytes();
+        self.send(&[cmd::WRITE_REGISTER_OR_MASK, reg, m[0], m[1], m[2], m[3]])
+    }
+
+    pub fn write_register_and_mask(&mut self, reg: u8, mask: u32) -> Result<(), Error> {
+        let m = mask.to_le_bytes();
+        self.send(&[cmd::WRITE_REGISTER_AND_MASK, reg, m[0], m[1], m[2], m[3]])
+    }
+
+    /// Select a protocol's transmitter and receiver configuration from EEPROM.
+    pub fn load_rf_config(&mut self, tx: u8, rx: u8) -> Result<(), Error> {
+        self.send(&[cmd::LOAD_RF_CONFIG, tx, rx])
+    }
+
+    /// Energise the antenna. Nothing before this point draws RF current.
+    pub fn field_on(&mut self) -> Result<(), Error> {
+        self.send(&[cmd::RF_ON, 0x00])
+    }
+
+    pub fn field_off(&mut self) -> Result<(), Error> {
+        self.send(&[cmd::RF_OFF, 0x00])
+    }
+
+    /// Blocking delay, so callers can pace probes without owning a second delay source.
+    pub fn delay_ms(&mut self, ms: u32) {
+        self.delay.delay_us(ms * 1000);
+    }
+
+    /// Clear every interrupt status bit.
+    pub fn clear_all_irqs(&mut self) -> Result<(), Error> {
+        self.clear_irqs()
+    }
+
+    fn clear_irqs(&mut self) -> Result<(), Error> {
+        self.write_register(reg::IRQ_CLEAR, ALL_IRQS)
+    }
+
+    /// Put the transceiver into Transceive so the next `SEND_DATA` actually goes out.
+    ///
+    /// Required before *every* frame: after a transaction the state machine falls back
+    /// to Idle, and a `SEND_DATA` issued from Idle is accepted without complaint and
+    /// never transmitted.
+    /// Snapshot of the three registers worth seeing when RF is not working:
+    /// `(RF_STATUS, IRQ_STATUS, RX_STATUS)`.
+    pub fn rf_debug(&mut self) -> Result<(u32, u32, u32), Error> {
+        Ok((
+            self.read_register(reg::RF_STATUS)?,
+            self.read_register(reg::IRQ_STATUS)?,
+            self.read_register(reg::RX_STATUS)?,
+        ))
+    }
+
+    fn begin_transceive(&mut self) -> Result<(), Error> {
+        self.write_register_and_mask(reg::SYSTEM_CONFIG, 0xffff_fff8)?;
+        self.write_register_or_mask(reg::SYSTEM_CONFIG, 0x0000_0003)?;
+        // The state machine takes a moment to arrive at WaitTransmit, and a SEND_DATA
+        // issued before it does is accepted without error and never transmitted — which
+        // looks identical to a tag that is not there.
+        for _ in 0..1_000 {
+            if transceive_state(self.read_register(reg::RF_STATUS)?) == TS_WAIT_TRANSMIT {
+                return Ok(());
+            }
+            self.delay.delay_us(100);
+        }
+        Err(Error::NotReadyToTransmit)
+    }
+
+    /// Transmit a frame. `data` may be empty, which sends a bare EOF — that is how
+    /// ISO 15693 advances to the next anticollision slot.
+    fn send_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.begin_transceive()?;
+        // Command, then "number of valid bits in the last byte", 0 meaning all eight.
+        let mut frame = [0u8; 2 + MAX_FRAME];
+        frame[0] = cmd::SEND_DATA;
+        frame[1] = 0x00;
+        frame[2..2 + data.len()].copy_from_slice(data);
+        self.send(&frame[..2 + data.len()])
+    }
+
+    /// How many bytes the receiver is holding.
+    fn rx_len(&mut self) -> Result<usize, Error> {
+        Ok((self.read_register(reg::RX_STATUS)? & 0x1ff) as usize)
+    }
+
+    /// Wait for a frame, and return its length. `None` means nothing answered, which for
+    /// an inventory slot is the ordinary case rather than an error.
+    fn await_frame(&mut self, timeout_us: u32) -> Result<Option<usize>, Error> {
+        let steps = timeout_us / 100;
+        for _ in 0..steps {
+            if self.read_register(reg::IRQ_STATUS)? & RX_IRQ != 0 {
+                return Ok(Some(self.rx_len()?));
+            }
+            self.delay.delay_us(100);
+        }
+        Ok(None)
+    }
+
+    fn read_data(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+        self.send(&[cmd::READ_DATA, 0x00])?;
+        self.recv(buf)
+    }
+
+    /// Configure the RF front end for ISO 15693 and switch the field on.
+    ///
+    /// Separate from [`Self::inventory`] because the field should stay up between polls:
+    /// tags need time to power up from the field, so cycling it every second would cost
+    /// read reliability for no benefit.
+    pub fn begin_iso15693(&mut self) -> Result<(), Error> {
+        // 0x0d / 0x8d are the ISO 15693 ASK100 26 kbit/s transmitter and receiver
+        // profiles in the stock EEPROM configuration.
+        self.load_rf_config(0x0d, 0x8d)?;
+        self.field_on()
+    }
+
+    /// One single-slot inventory, returning the raw response length and bytes.
+    ///
+    /// Bring-up counterpart to [`Self::inventory`]: one slot, no EOF stepping, no
+    /// parsing. It separates "no tag is answering" from "the anticollision round is
+    /// wrong", which the 16-slot version cannot distinguish because both look like zero
+    /// tags found. `data_rate_high` is worth trying both ways — some tags are markedly
+    /// more reliable at the low rate.
+    pub fn inventory_single_raw(
+        &mut self,
+        buf: &mut [u8],
+        data_rate_high: bool,
+    ) -> Result<usize, Error> {
+        // 0x04 inventory + 0x20 one slot, plus 0x02 for the high data rate.
+        let flags = 0x24 | if data_rate_high { 0x02 } else { 0x00 };
+        self.clear_irqs()?;
+        self.send_data(&[flags, 0x01, 0x00])?;
+        match self.await_frame(20_000)? {
+            None => Ok(0),
+            Some(len) => {
+                let len = len.min(buf.len());
+                if len > 0 {
+                    self.read_data(&mut buf[..len])?;
+                }
+                Ok(len)
+            }
+        }
+    }
+
+    /// Run one 16-slot inventory round, collecting every tag that answers.
+    ///
+    /// Sixteen slots rather than one is the entire reason a single reader can serve both
+    /// devices: with one slot, two tags answering together collide and *neither* is read,
+    /// which would look exactly like both devices being absent — the most damaging
+    /// possible failure, since it silently stops the clock.
+    ///
+    /// Returns the number of UIDs written to `out`. Slots that stay silent, or that
+    /// collide, are skipped rather than retried: the caller polls again in a second, and
+    /// the firmware requires several consecutive misses before believing a tag is gone.
+    pub fn inventory(&mut self, out: &mut [Uid]) -> Result<usize, Error> {
+        // Flags: 0x02 high data rate, 0x04 inventory. Bit 5 clear selects 16 slots.
+        const FLAGS: u8 = 0x06;
+        const CMD_INVENTORY: u8 = 0x01;
+
+        self.clear_irqs()?;
+        // Mask length zero: no prefix filter, every tag participates.
+        self.send_data(&[FLAGS, CMD_INVENTORY, 0x00])?;
+
+        let mut found = 0;
+        for slot in 0..16 {
+            // A tag replies within about 4 ms at 26 kbit/s; 10 ms is slack for a tag at
+            // the edge of the field without making a full round unreasonably slow.
+            if let Some(len) = self.await_frame(10_000)? {
+                if (10..=MAX_FRAME).contains(&len) {
+                    let mut buf = [0u8; MAX_FRAME];
+                    self.read_data(&mut buf[..len])?;
+                    if let Some(uid) = parse_inventory_response(&buf[..len]) {
+                        // Deduplicate: a tag can answer in more than one round if the
+                        // field flickers, and a duplicate would look like a third device.
+                        if !out[..found].contains(&uid) {
+                            if found == out.len() {
+                                return Err(Error::Overflow);
+                            }
+                            out[found] = uid;
+                            found += 1;
+                        }
+                    }
+                }
+            }
+            // Advance to the next slot with a bare EOF. Not needed after the last one.
+            if slot < 15 {
+                self.clear_irqs()?;
+                self.send_data(&[])?;
+            }
+        }
+        Ok(found)
+    }
+}
+
+/// Longest frame we will send or receive. Inventory responses are 10 bytes; the margin
+/// covers the longer ICODE commands this will grow into.
+pub const MAX_FRAME: usize = 64;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real ICODE SLIX response: flags, DSFID, then the UID least significant byte
+    /// first. `e0` is the last wire byte because it is the first in display order.
+    fn slix() -> [u8; 10] {
+        [0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x04, 0xe0]
+    }
+
+    #[test]
+    fn decodes_a_tag() {
+        let uid = parse_inventory_response(&slix()).expect("valid response");
+        assert_eq!(uid.0, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x04, 0xe0]);
+        assert_eq!(uid.manufacturer(), 0x04, "NXP");
+    }
+
+    #[test]
+    fn display_order_starts_with_e0() {
+        let uid = parse_inventory_response(&slix()).unwrap();
+        assert_eq!(
+            uid.display_order(),
+            [0xe0, 0x04, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
+        );
+    }
+
+    #[test]
+    fn rejects_short_frames() {
+        let full = slix();
+        for n in 0..10 {
+            assert_eq!(parse_inventory_response(&full[..n]), None, "len {n}");
+        }
+    }
+
+    #[test]
+    fn rejects_the_error_flag() {
+        let mut r = slix();
+        r[0] = 0x01;
+        assert_eq!(parse_inventory_response(&r), None);
+    }
+
+    /// The failure this guard exists for: a frame that is the right length and looks
+    /// like data, but is offset by a byte. Without the `e0` check it would yield a
+    /// stable, plausible UID — and stably identify the wrong device forever.
+    #[test]
+    fn rejects_a_shifted_frame() {
+        let mut shifted = [0u8; 10];
+        shifted[..9].copy_from_slice(&slix()[1..]);
+        assert_eq!(parse_inventory_response(&shifted), None);
+    }
+
+    #[test]
+    fn distinct_tags_compare_unequal() {
+        let a = parse_inventory_response(&slix()).unwrap();
+        let mut other = slix();
+        other[2] = 0x99;
+        let b = parse_inventory_response(&other).unwrap();
+        assert_ne!(a, b);
     }
 }
