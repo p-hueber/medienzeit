@@ -696,6 +696,33 @@ where
         Ok(None)
     }
 
+    /// Find the tags in the field.
+    ///
+    /// **One slot, so exactly one tag.** Verified against a real ICODE SLIX2 sticker.
+    /// [`Self::inventory_16slot`] is the anticollision version the design actually
+    /// wants, and it does not work — it reads nothing where this reads reliably.
+    ///
+    /// # Do not deploy a second sticker until that is fixed
+    ///
+    /// With two tags in the field a single slot collides and *neither* answers, so both
+    /// devices read as absent and the clock runs for both — the most damaging failure
+    /// this system has, because it is silent and it costs her time she did not use.
+    /// One sticker plus the button fallback is safe; two stickers is not.
+    pub fn inventory(&mut self, out: &mut [Uid]) -> Result<usize, Error> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let mut buf = [0u8; MAX_FRAME];
+        let n = self.inventory_single_raw(&mut buf, true)?;
+        match parse_inventory_response(&buf[..n]) {
+            Some(uid) => {
+                out[0] = uid;
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    }
+
     /// Run one 16-slot inventory round, collecting every tag that answers.
     ///
     /// Sixteen slots rather than one is the entire reason a single reader can serve both
@@ -703,10 +730,16 @@ where
     /// which would look exactly like both devices being absent — the most damaging
     /// possible failure, since it silently stops the clock.
     ///
+    /// **Known not to work.** Reads nothing against a tag that single-slot inventory
+    /// reads every time, so the slot stepping is wrong: `send_data(&[])` calls
+    /// `begin_transceive`, which resets the state machine and almost certainly ends the
+    /// round rather than advancing it. The PN5180 wants an EOF sent within the same
+    /// transceive session, configured through `TX_CONFIG`.
+    ///
     /// Returns the number of UIDs written to `out`. Slots that stay silent, or that
     /// collide, are skipped rather than retried: the caller polls again in a second, and
     /// the firmware requires several consecutive misses before believing a tag is gone.
-    pub fn inventory(&mut self, out: &mut [Uid]) -> Result<usize, Error> {
+    pub fn inventory_16slot(&mut self, out: &mut [Uid]) -> Result<usize, Error> {
         // Flags: 0x02 high data rate, 0x04 inventory. Bit 5 clear selects 16 slots.
         const FLAGS: u8 = 0x06;
         const CMD_INVENTORY: u8 = 0x01;

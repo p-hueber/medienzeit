@@ -156,11 +156,18 @@ pub fn identify(reader: &mut Reader<'static>) {
             .and_then(|()| reader.read_register(TIMER1_RELOAD))
     };
     match probe(reader, 0xffff_ffff) {
+        Ok(0) => println!(
+            "reader: register writable mask 0x00000000 — the chip is not answering, \
+             not a narrow register"
+        ),
         Ok(mask) => {
             println!("reader: register writable mask {mask:#010x} ({} bits)", mask.count_ones());
             let pattern = 0xa5c3_5a5a & mask;
             match (probe(reader, 0), probe(reader, pattern)) {
-                (Ok(0), Ok(v)) if v == pattern => {
+                // `pattern` is masked, so a dead chip would compare zero against zero
+                // and call it proven. Guarded above by rejecting an empty mask, and
+                // again here, because this line is the one that gets trusted.
+                (Ok(0), Ok(v)) if v == pattern && pattern != 0 => {
                     println!("reader: register round trip ok ({pattern:#010x}) — framing proven")
                 }
                 (z, p) => println!("reader: round trip suspect, zero={z:?} pattern={p:?}"),
