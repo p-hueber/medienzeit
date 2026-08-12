@@ -59,12 +59,19 @@ pub mod reg {
     pub const CRC_RX_CONFIG: u8 = 0x12;
     /// Bit 0 enables the transmitter's CRC.
     pub const CRC_TX_CONFIG: u8 = 0x19;
+    /// Transmitter framing. Clearing bits 6, 7 and 10 makes it send a bare EOF.
+    pub const TX_CONFIG: u8 = 0x18;
 }
 
 /// Transceive state meaning "ready for the host to hand over a frame".
 const TS_WAIT_TRANSMIT: u32 = 1;
 /// Transceive state meaning the machine has finished and is doing nothing.
 const TS_IDLE: u32 = 0;
+
+/// Clears the TX_CONFIG bits that carry data framing, leaving the transmitter emitting
+/// only an EOF. That is how an ISO 15693 anticollision round steps to the next slot:
+/// a zero-length `SEND_DATA` on its own transmits nothing at all.
+const TX_CONFIG_EOF_ONLY: u32 = 0xffff_fb3f;
 
 /// Requests per poll before a card counts as absent. Cheap: each is a ~20 ms timeout,
 /// and only a genuinely absent card pays the full cost.
@@ -261,6 +268,69 @@ pub fn parse_anticollision(buf: &[u8]) -> Option<CardUid> {
         return None;
     }
     Some(CardUid(uid))
+}
+
+
+/// Smooths tag presence over consecutive inventory rounds.
+///
+/// A tag is believed present the moment it is seen, and believed gone only after it has
+/// been missing from several rounds in a row. Tracking that **per tag** rather than per
+/// count is the point: with two tags in the field, a round that happens to see only one
+/// of them keeps the count at one, so a count-based check sees "still one tag" and
+/// silently swaps which device is present. Observed on hardware — putting one sticker
+/// back flipped both devices at once, and the untouched one read as taken.
+pub struct TagSet<const N: usize> {
+    tags: [Uid; N],
+    /// Rounds since each tag was last seen.
+    missing: [u32; N],
+    len: usize,
+    limit: u32,
+}
+
+impl<const N: usize> TagSet<N> {
+    /// `limit` is how many consecutive rounds a tag may be missing before it counts as
+    /// gone. Zero means believe every round exactly as it comes.
+    pub fn new(limit: u32) -> Self {
+        Self { tags: [Uid::default(); N], missing: [0; N], len: 0, limit }
+    }
+
+    pub fn tags(&self) -> &[Uid] {
+        &self.tags[..self.len]
+    }
+
+    pub fn contains(&self, uid: &Uid) -> bool {
+        self.tags().contains(uid)
+    }
+
+    /// Fold one round's reading in, and return the believed set.
+    pub fn update(&mut self, seen: &[Uid]) -> &[Uid] {
+        // Age existing entries, dropping those missing for too long. Iterating downwards
+        // keeps the swap-remove from skipping an entry.
+        let mut i = self.len;
+        while i > 0 {
+            i -= 1;
+            if seen.contains(&self.tags[i]) {
+                self.missing[i] = 0;
+            } else {
+                self.missing[i] += 1;
+                if self.missing[i] > self.limit {
+                    self.len -= 1;
+                    self.tags[i] = self.tags[self.len];
+                    self.missing[i] = self.missing[self.len];
+                }
+            }
+        }
+        // Newly seen tags are believed at once: a device being picked up should register
+        // immediately, where a device going quiet deserves the benefit of the doubt.
+        for uid in seen {
+            if !self.tags[..self.len].contains(uid) && self.len < N {
+                self.tags[self.len] = *uid;
+                self.missing[self.len] = 0;
+                self.len += 1;
+            }
+        }
+        self.tags()
+    }
 }
 
 pub struct Pn5180<SPI, BUSY, D> {
@@ -696,31 +766,14 @@ where
         Ok(None)
     }
 
-    /// Find the tags in the field.
+    /// Find every tag in the field, with anticollision.
     ///
-    /// **One slot, so exactly one tag.** Verified against a real ICODE SLIX2 sticker.
-    /// [`Self::inventory_16slot`] is the anticollision version the design actually
-    /// wants, and it does not work — it reads nothing where this reads reliably.
-    ///
-    /// # Do not deploy a second sticker until that is fixed
-    ///
-    /// With two tags in the field a single slot collides and *neither* answers, so both
-    /// devices read as absent and the clock runs for both — the most damaging failure
-    /// this system has, because it is silent and it costs her time she did not use.
-    /// One sticker plus the button fallback is safe; two stickers is not.
+    /// Verified against two ICODE SLIX2 stickers: both UIDs, every round. The
+    /// single-slot alternative reads *nothing* with two tags present — they collide and
+    /// neither answers — which is why this has to be the default. That failure is
+    /// silent and would run the clock on both devices at once.
     pub fn inventory(&mut self, out: &mut [Uid]) -> Result<usize, Error> {
-        if out.is_empty() {
-            return Ok(0);
-        }
-        let mut buf = [0u8; MAX_FRAME];
-        let n = self.inventory_single_raw(&mut buf, true)?;
-        match parse_inventory_response(&buf[..n]) {
-            Some(uid) => {
-                out[0] = uid;
-                Ok(1)
-            }
-            None => Ok(0),
-        }
+        self.inventory_16slot(out)
     }
 
     /// Run one 16-slot inventory round, collecting every tag that answers.
@@ -744,21 +797,24 @@ where
         const FLAGS: u8 = 0x06;
         const CMD_INVENTORY: u8 = 0x01;
 
+        // Start from a known transmitter configuration: a previous round leaves it in
+        // EOF-only mode, and a data frame sent in that state goes out as nothing.
+        self.load_rf_config(0x0d, 0x8d)?;
         self.clear_irqs()?;
         // Mask length zero: no prefix filter, every tag participates.
         self.send_data(&[FLAGS, CMD_INVENTORY, 0x00])?;
 
         let mut found = 0;
         for slot in 0..16 {
-            // A tag replies within about 4 ms at 26 kbit/s; 10 ms is slack for a tag at
+            // A tag replies within about 4 ms at 26 kbit/s; 10 ms is slack for one at
             // the edge of the field without making a full round unreasonably slow.
             if let Some(len) = self.await_frame(10_000)? {
                 if (10..=MAX_FRAME).contains(&len) {
                     let mut buf = [0u8; MAX_FRAME];
                     self.read_data(&mut buf[..len])?;
                     if let Some(uid) = parse_inventory_response(&buf[..len]) {
-                        // Deduplicate: a tag can answer in more than one round if the
-                        // field flickers, and a duplicate would look like a third device.
+                        // Deduplicate: a tag can answer more than once if the field
+                        // flickers, and a duplicate would look like a third device.
                         if !out[..found].contains(&uid) {
                             if found == out.len() {
                                 return Err(Error::Overflow);
@@ -769,12 +825,15 @@ where
                     }
                 }
             }
-            // Advance to the next slot with a bare EOF. Not needed after the last one.
+            // Step to the next slot with a bare EOF. Not needed after the last one.
             if slot < 15 {
+                self.write_register_and_mask(reg::TX_CONFIG, TX_CONFIG_EOF_ONLY)?;
                 self.clear_irqs()?;
                 self.send_data(&[])?;
             }
         }
+        // Leave the transmitter able to send data again.
+        self.load_rf_config(0x0d, 0x8d)?;
         Ok(found)
     }
 }
@@ -928,6 +987,66 @@ mod tests {
         for bad in ["", "deadbe", "deadbeef00", "deadbeeg"] {
             assert_eq!(CardUid::from_hex(bad), None, "{bad:?}");
         }
+    }
+
+
+    fn uid(n: u8) -> Uid {
+        Uid([n, 0, 0, 0, 0, 0, 0x04, 0xe0])
+    }
+
+    #[test]
+    fn a_new_tag_is_believed_immediately() {
+        let mut set: TagSet<4> = TagSet::new(3);
+        assert_eq!(set.update(&[uid(1)]), &[uid(1)]);
+    }
+
+    #[test]
+    fn a_single_dropped_round_is_tolerated() {
+        let mut set: TagSet<4> = TagSet::new(3);
+        set.update(&[uid(1)]);
+        assert_eq!(set.update(&[]), &[uid(1)], "one miss must not remove it");
+        assert_eq!(set.update(&[uid(1)]), &[uid(1)]);
+    }
+
+    #[test]
+    fn a_tag_goes_once_it_stays_missing() {
+        let mut set: TagSet<4> = TagSet::new(3);
+        set.update(&[uid(1)]);
+        for _ in 0..3 {
+            assert_eq!(set.update(&[]).len(), 1);
+        }
+        assert!(set.update(&[]).is_empty(), "gone after limit+1 misses");
+    }
+
+    /// The hardware bug this exists for: two tags present, one round sees only the
+    /// other. A count-based check keeps the count at one and swaps which device is
+    /// present, marking an untouched device as taken.
+    #[test]
+    fn a_round_that_sees_the_other_tag_does_not_swap_them() {
+        let mut set: TagSet<4> = TagSet::new(3);
+        set.update(&[uid(1), uid(2)]);
+        let after = set.update(&[uid(2)]);
+        assert!(after.contains(&uid(1)), "the missed tag must survive one round");
+        assert!(after.contains(&uid(2)));
+        assert_eq!(after.len(), 2);
+    }
+
+    #[test]
+    fn a_real_removal_still_registers_with_the_other_present() {
+        let mut set: TagSet<4> = TagSet::new(3);
+        set.update(&[uid(1), uid(2)]);
+        for _ in 0..4 {
+            set.update(&[uid(2)]);
+        }
+        assert_eq!(set.tags(), &[uid(2)]);
+    }
+
+    #[test]
+    fn removing_the_first_of_several_keeps_the_rest() {
+        let mut set: TagSet<4> = TagSet::new(0);
+        set.update(&[uid(1), uid(2), uid(3)]);
+        assert_eq!(set.update(&[uid(2), uid(3)]).len(), 2);
+        assert!(set.contains(&uid(2)) && set.contains(&uid(3)));
     }
 
     #[test]

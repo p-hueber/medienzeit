@@ -52,7 +52,7 @@ use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
 use esp_println::{print, println};
-use medienzeit_pn5180::{CardUid, Pn5180, Uid};
+use medienzeit_pn5180::{CardUid, Pn5180, TagSet, Uid};
 
 /// Most tags we expect in the field at once. Two devices, plus slack so a stray tag
 /// shows up in the log rather than being silently dropped.
@@ -297,20 +297,24 @@ pub async fn agc_watch(reader: &mut Reader<'static>, _secs: u32) {
 ///
 /// Printing every poll would bury the transitions that matter in a wall of identical
 /// lines, and the transitions are the whole signal during bring-up.
-#[derive(Default)]
 pub struct Scan {
-    tags: [Uid; MAX_TAGS],
-    n: usize,
-    /// Consecutive polls in which a previously-seen tag did not answer.
-    misses: u32,
+    set: TagSet<MAX_TAGS>,
+    last: usize,
+    known: [Uid; MAX_TAGS],
 }
 
-/// Misses tolerated before believing a tag has really gone.
+/// Rounds a tag may be missing before it counts as gone.
 ///
-/// A single dropped read is routine — the tag is passive and at the edge of the field —
-/// and treating one as a departure would start the clock every few seconds while the
-/// device sits untouched.
+/// A tag is passive and sits at the edge of the field, so single dropped reads are
+/// routine; treating one as a departure would start the clock while the device has not
+/// moved. Tolerance is per tag, not per count — see [`TagSet`].
 const MISS_LIMIT: u32 = 3;
+
+impl Default for Scan {
+    fn default() -> Self {
+        Self { set: TagSet::new(MISS_LIMIT), last: 0, known: [Uid::default(); MAX_TAGS] }
+    }
+}
 
 impl Scan {
     /// Poll once. Returns the current tag set, or `None` if the reader errored.
@@ -324,20 +328,14 @@ impl Scan {
             }
         };
 
-        let same = n == self.n && found[..n].iter().all(|u| self.tags[..self.n].contains(u));
-        if same {
-            self.misses = 0;
-        } else if n < self.n && self.misses < MISS_LIMIT {
-            // Fewer tags than last time: hold the old set until it repeats, so one
-            // glitchy read cannot look like a device being picked up.
-            self.misses += 1;
-            return Some(&self.tags[..self.n]);
-        } else {
-            self.misses = 0;
-            self.tags = found;
-            self.n = n;
-            print!("reader: {n} tag(s)");
-            for uid in &found[..n] {
+        let believed = self.set.update(&found[..n]);
+        let changed = believed.len() != self.last
+            || !believed.iter().all(|u| self.known[..self.last].contains(u));
+        if changed {
+            self.last = believed.len();
+            self.known[..believed.len()].copy_from_slice(believed);
+            print!("reader: {} tag(s)", believed.len());
+            for uid in believed {
                 print!(" ");
                 for b in uid.display_order() {
                     print!("{b:02x}");
@@ -345,7 +343,7 @@ impl Scan {
             }
             println!();
         }
-        Some(&self.tags[..self.n])
+        Some(self.set.tags())
     }
 }
 
@@ -364,7 +362,7 @@ pub async fn bringup_scan(
     println!("reader: scanning for {secs}s — present a tag");
     let mut last_card = None;
     let mut tracker = CardTracker::default();
-    for i in 0..secs {
+    for _ in 0..secs {
         if cards {
             // Report card UIDs so they can be copied into tags.toml, debounced the same
             // way the control loop does it — an unfiltered log would show flapping that
@@ -377,107 +375,12 @@ pub async fn bringup_scan(
                 }
                 last_card = card;
             }
-            embassy_time::Timer::after(embassy_time::Duration::from_secs(1)).await;
-            continue;
-        }
-        scan.poll(reader);
-        // Periodic register dump: with no tag answering, these three say whether the
-        // transmitter is even reaching the right state, and whether anything was heard.
-        // Alternate the data rate: some ICODE tags answer far more reliably at the low
-        // rate, and trying only one would leave that untested.
-        let high = i % 2 == 0;
-        let mut raw = [0u8; 32];
-        match reader.inventory_single_raw(&mut raw, high) {
-            Ok(0) => {}
-            Ok(n) => {
-                print!("reader: single-slot ({}) rx {n}:", if high { "high" } else { "low" });
-                for b in &raw[..n] {
-                    print!(" {b:02x}");
-                }
-                println!();
-            }
-            Err(e) => println!("reader: single-slot failed ({e:?})"),
-        }
-        if i % 10 == 0 {
-            match reader.rf_debug() {
-                Ok((rf, irq, rx)) => println!(
-                    "reader: rf={rf:#010x} (state {}) irq={irq:#010x} rx={rx:#010x}",
-                    medienzeit_pn5180::transceive_state(rf)
-                ),
-                Err(e) => println!("reader: rf_debug failed ({e:?})"),
-            }
+        } else {
+            scan.poll(reader);
         }
         embassy_time::Timer::after(embassy_time::Duration::from_secs(1)).await;
     }
     println!("reader: scan window over");
-}
-
-/// Try to bring the transmitter up several different ways, reporting what each does.
-///
-/// The question this answers is narrow: does `RF_ON` ever raise an interrupt? A bare
-/// `RF_ON` with no configuration loaded separates "our RF config index is wrong" from
-/// "the transmitter is dead", and sweeping a few indices covers the possibility that
-/// this module's EEPROM lays them out differently from the datasheet's table.
-///
-/// Kept though unreferenced: this is the tool that showed the field does come up,
-/// after two wrong "the transmitter is dead" conclusions. Call it from `main` when RF
-/// misbehaves.
-#[allow(dead_code)]
-pub fn rf_probe(reader: &mut Reader<'static>) {
-    // `None` means skip LOAD_RF_CONFIG entirely.
-    let candidates: [(Option<(u8, u8)>, &str); 6] = [
-        (None, "no config at all"),
-        (Some((0x0d, 0x8d)), "ISO 15693 ASK100 26k"),
-        (Some((0x0c, 0x8c)), "neighbouring index"),
-        (Some((0x0e, 0x8e)), "neighbouring index"),
-        (Some((0x00, 0x80)), "ISO 14443A 106k"),
-        (Some((0x0d, 0x8c)), "mismatched tx/rx"),
-    ];
-
-    for (cfg, what) in candidates {
-        let _ = reader.field_off();
-        reader.delay_ms(20);
-        let loaded = match cfg {
-            None => Ok(()),
-            Some((tx, rx)) => reader.load_rf_config(tx, rx),
-        };
-        let _ = reader.clear_all_irqs();
-        let on = reader.field_on();
-        reader.delay_ms(20);
-        let irq = reader.read_register(medienzeit_pn5180::reg::IRQ_STATUS);
-        let rf = reader.read_register(medienzeit_pn5180::reg::RF_STATUS);
-        match (loaded, on, irq, rf) {
-            (Ok(()), Ok(()), Ok(i), Ok(r)) => println!(
-                "reader: probe {what:22} irq={i:#010x} rf={r:#010x} {}",
-                if i != 0 { "<-- SOMETHING HAPPENED" } else { "" }
-            ),
-            (l, o, i, r) => {
-                println!("reader: probe {what:22} load={l:?} on={o:?} irq={i:?} rf={r:?}")
-            }
-        }
-    }
-    let _ = reader.field_off();
-    println!("reader: probe done");
-}
-
-/// Control experiment: does *any* card answer, in any protocol?
-///
-/// Runs before the ISO 15693 work so a silent inventory can be attributed correctly.
-/// A card that answers here is a 14443A part and will never appear in an ISO 15693
-/// inventory however well the reader works.
-///
-/// Kept though unreferenced: the control that distinguishes a broken reader from a tag
-/// speaking another protocol. Both are silence otherwise.
-#[allow(dead_code)]
-pub fn probe_other_protocol(reader: &mut Reader<'static>) {
-    match reader.probe_iso14443a() {
-        Ok(Some(atqa)) => println!(
-            "reader: ISO 14443A card answered, ATQA {:02x}{:02x} — antenna and receive path work",
-            atqa[0], atqa[1]
-        ),
-        Ok(None) => println!("reader: no ISO 14443A answer either"),
-        Err(e) => println!("reader: 14443A probe failed ({e:?})"),
-    }
 }
 
 /// Maps the tags in the field onto each device's `docked` flag.
@@ -684,5 +587,55 @@ impl CardTracker {
             }
         }
         self.current
+    }
+}
+
+/// Run both inventory methods side by side and report what each sees.
+///
+/// Kept though unreferenced: this is what proved the anticollision round, and it is the
+/// tool to reach for if tag reads ever go strange — the single-slot path is a control
+/// that fails differently.
+///
+/// The single-slot path is known good, so it is the control: if it finds one tag while
+/// the 16-slot round finds none, the anticollision stepping is still wrong rather than
+/// the tags being absent. With two tags in the field the expected result is the whole
+/// point — single-slot should collide and find nothing, 16-slot should find both.
+#[allow(dead_code)]
+pub async fn compare_inventory(reader: &mut Reader<'static>, secs: u32) {
+    println!("reader: comparing inventory methods for {secs}s — put BOTH stickers in the field");
+    for _ in 0..secs {
+        let mut one = [Uid::default(); MAX_TAGS];
+        let mut many = [Uid::default(); MAX_TAGS];
+        let a = reader.inventory(&mut one);
+        let b = reader.inventory_16slot(&mut many);
+        print!("reader: single=");
+        match a {
+            Ok(n) => print_uids(&one[..n]),
+            Err(e) => print!("{e:?}"),
+        }
+        print!("  16slot=");
+        match b {
+            Ok(n) => print_uids(&many[..n]),
+            Err(e) => print!("{e:?}"),
+        }
+        println!();
+        embassy_time::Timer::after(embassy_time::Duration::from_secs(1)).await;
+    }
+    println!("reader: comparison over");
+}
+
+#[allow(dead_code)]
+fn print_uids(uids: &[Uid]) {
+    if uids.is_empty() {
+        print!("none");
+        return;
+    }
+    for (i, u) in uids.iter().enumerate() {
+        if i > 0 {
+            print!(",");
+        }
+        for b in u.display_order() {
+            print!("{b:02x}");
+        }
     }
 }
