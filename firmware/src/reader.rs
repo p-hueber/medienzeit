@@ -51,6 +51,9 @@ use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
+use core::cell::RefCell;
 use esp_println::{print, println};
 use medienzeit_pn5180::{CardUid, Pn5180, TagSet, Uid};
 
@@ -636,6 +639,101 @@ fn print_uids(uids: &[Uid]) {
         }
         for b in u.display_order() {
             print!("{b:02x}");
+        }
+    }
+}
+
+/// The docking state the reader task believes, for the control loop to read.
+///
+/// A value cell rather than a signal: the control loop reads it every tick, and a signal
+/// would hand the state to whoever asked first and leave the next reader with nothing.
+/// Starts docked, matching the ledger's own fresh-state assumption — until something is
+/// known, do not spend.
+static DOCKED: Mutex<CriticalSectionRawMutex, RefCell<[bool; 2]>> =
+    Mutex::new(RefCell::new([true; 2]));
+
+/// What the reader currently believes about each device.
+pub fn docked() -> [bool; 2] {
+    DOCKED.lock(|c| *c.borrow())
+}
+
+/// Poll the reader once a second and publish docking state.
+///
+/// Owning the reader here keeps SPI out of the control loop, which now only reads a
+/// pair of booleans. Note this does not make the polling concurrent: the driver is
+/// synchronous, so a full 16-slot round still blocks the executor for a couple of
+/// hundred milliseconds. Fixing that means an async driver, not a task.
+///
+/// Alerts are emitted here rather than published, because they are edge-triggered. A
+/// cell the control loop polls would re-fire them every tick.
+#[embassy_executor::task]
+pub async fn task(
+    mut nfc: Reader<'static>,
+    mut docking: Docking,
+    cards: bool,
+    boot: Input<'static>,
+) {
+    let mut scan = Scan::default();
+    let mut card_tracker = CardTracker::default();
+    let mut last = docked();
+    let mut last_recoveries = 0;
+    let mut ticker = embassy_time::Ticker::every(embassy_time::Duration::from_secs(1));
+
+    loop {
+        ticker.next().await;
+
+        // One protocol per build; see tags.toml. A reader failure has to reach Docking
+        // as a failure in either protocol — `Some(&[])` would say "the reader is fine
+        // and nothing is there", which is what makes a broken reader start the clock.
+        let (seen, card) = if cards {
+            match poll_card(&mut nfc) {
+                Some(raw) => (Some(&[][..]), card_tracker.update(raw)),
+                None => (None, None),
+            }
+        } else {
+            (scan.poll(&mut nfc), None)
+        };
+        let d = docking.update(seen, card, [boot.is_high(), true]);
+        DOCKED.lock(|c| *c.borrow_mut() = d.docked);
+
+        // Reads can keep succeeding while the front end is quietly having to be cycled,
+        // and a rising count is the early warning.
+        let r = nfc.recoveries();
+        if r != last_recoveries {
+            println!("reader: rf recoveries {r}");
+            last_recoveries = r;
+        }
+
+        // Log the transition, not the state: at the balance cap, filling and held look
+        // identical in the numbers, so this is what shows identity driving the ledger.
+        if d.docked != last {
+            for (i, (&now, &before)) in d.docked.iter().zip(last.iter()).enumerate() {
+                if now != before {
+                    println!(
+                        "reader: {} {}",
+                        crate::DEV_NAMES[i],
+                        if now { "zurückgelegt" } else { "genommen" }
+                    );
+                }
+            }
+            last = d.docked;
+        }
+
+        if let Some(uid) = d.unknown {
+            let hex = uid_hex(&uid);
+            println!("  [alert] unknown tag {hex}");
+            let mut m: crate::notify::Message = heapless::String::new();
+            let _ = core::fmt::Write::write_fmt(
+                &mut m,
+                format_args!("Unbekannter Tag {hex} am Leser"),
+            );
+            crate::notify::send(&m);
+        }
+        if d.reader_fault {
+            println!("  [alert] reader not responding");
+            let mut m: crate::notify::Message = heapless::String::new();
+            let _ = core::fmt::Write::write_fmt(&mut m, format_args!("Leser antwortet nicht"));
+            crate::notify::send(&m);
         }
     }
 }
