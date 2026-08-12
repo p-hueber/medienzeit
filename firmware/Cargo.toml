@@ -21,7 +21,7 @@ embedded-storage = "0.3"
 embassy-executor = "0.10"
 embassy-time = "0.5"
 embassy-sync = "0.7"
-embassy-net = { version = "0.7", features = ["dhcpv4", "udp", "tcp", "dns", "medium-ethernet"] }
+embassy-net = { version = "0.7", features = ["dhcpv4", "dhcpv4-hostname", "udp", "tcp", "dns", "medium-ethernet"] }
 esp-radio = { version = "0.18", features = ["esp32s3", "wifi", "unstable"] }
 static_cell = "2"
 esp-println = { version = "0.17", default-features = false, features = ["esp32s3", "jtag-serial"] }

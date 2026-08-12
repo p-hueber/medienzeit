@@ -10,6 +10,7 @@ pub mod civil;
 pub mod journal;
 pub mod policy;
 pub mod rtc;
+pub mod settings;
 pub mod sntp;
 pub mod state;
 

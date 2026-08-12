@@ -176,10 +176,17 @@ async fn main(spawner: Spawner) {
         reader::bringup_scan(&mut nfc, &mut scan, 20, cards).await;
     }
 
-    let policy = Policy::default();
-
     // Recover the balance before anything else can spend it.
     let (mut journal, recovered) = storage::Journal::open(p.FLASH);
+
+    // Rules come from flash when they have ever been saved, and from the compiled-in
+    // defaults otherwise. Stored settings win because they are the more recent decision;
+    // a firmware update should not quietly revert a parent's choices.
+    let (mut settings_store, stored) = storage::SettingsStore::open(journal.flash());
+    let mut settings = stored
+        .unwrap_or_else(|| medienzeit_core::settings::Settings::from_policy(&Policy::default(), 0));
+    let mut policy = settings.to_policy();
+    web::publish_settings(settings);
     let mut ledger = match recovered {
         Some(rec) => Ledger::<2>::with_balance(rec.balance_secs),
         None => Ledger::<2>::new(&policy),
@@ -202,7 +209,14 @@ async fn main(spawner: Spawner) {
 
     let (stack, runner) = embassy_net::new(
         interfaces.station,
-        NetConfig::dhcpv4(Default::default()),
+        NetConfig::dhcpv4({
+            let mut dhcp = embassy_net::DhcpConfig::default();
+            // Ask the FRITZ!Box to register a name, so the admin page can be reached at
+            // medienzeit.fritz.box rather than at whatever address the lease happens to
+            // hand out. Falls back to the IP if the router ignores it.
+            dhcp.hostname = Some(heapless::String::try_from("medienzeit").unwrap());
+            dhcp
+        }),
         RESOURCES.init(StackResources::new()),
         seed,
     );
@@ -304,6 +318,18 @@ async fn main(spawner: Spawner) {
         // The RTC is authoritative between SNTP syncs, so a missed tick or a slow
         // network call cannot make the ledger lose time.
         let t = rtc::now(&mut i2c).unwrap_or(state.last_tick + 1);
+
+        // A rules change from the admin page arrives out of band. Persist first, so a
+        // power cut immediately after cannot leave the running rules and the stored
+        // ones disagreeing — the stored ones are what the next boot believes.
+        if let Some(new) = web::take_settings() {
+            if settings_store.save(journal.flash(), new) {
+                settings = new;
+                policy = settings.to_policy();
+                web::publish_settings(settings);
+                println!("medienzeit: rules updated");
+            }
+        }
 
         // A grant from the admin page arrives out of band; apply it before the tick
         // so the new balance is what gets journalled and displayed this second.
