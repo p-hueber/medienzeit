@@ -16,7 +16,7 @@ use embedded_hal_bus::spi::ExclusiveDevice;
 use epd_waveshare::color::Color;
 use epd_waveshare::epd1in54_v2::Epd1in54;
 use epd_waveshare::prelude::RefreshLut;
-use epd_waveshare::graphics::Display as EpdDisplay;
+use epd_waveshare::graphics::{Display as EpdDisplay, DisplayRotation};
 use epd_waveshare::prelude::*;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
@@ -27,6 +27,23 @@ use esp_println::println;
 
 pub const WIDTH: u32 = 200;
 pub const HEIGHT: u32 = 200;
+
+/// How the drawn image sits on the glass.
+///
+/// The panel is square, so this changes nothing about the layout — it only decides which
+/// physical edge is "up". Driven by where the ribbon and connectors end up, which is a
+/// property of the installation rather than of the UI.
+pub const ROTATION: DisplayRotation = DisplayRotation::Rotate90;
+
+/// A framebuffer oriented for the panel as mounted.
+///
+/// Always construct through this: a plain `Framebuffer::default()` is unrotated, and the
+/// mistake shows up as a picture that is merely sideways rather than as an error.
+pub fn framebuffer() -> Framebuffer {
+    let mut fb = Framebuffer::default();
+    fb.set_rotation(ROTATION);
+    fb
+}
 
 /// Framebuffer matching the panel geometry.
 pub type Framebuffer =

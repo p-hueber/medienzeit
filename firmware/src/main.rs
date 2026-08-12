@@ -592,7 +592,7 @@ fn parse_ipv4(s: &str) -> Option<embassy_net::IpAddress> {
 }
 
 fn show(panel: &mut panel::Panel<'static>, snapshot: &Snapshot<2>, mode: panel::Refresh) {
-    let mut fbuf = panel::Framebuffer::default();
+    let mut fbuf = panel::framebuffer();
     let chrome = Chrome { device_names: DEV_NAMES };
     medienzeit_ui::render(&mut panel::InkTarget(&mut fbuf), snapshot, &chrome).unwrap();
     panel.present(&fbuf, mode);
