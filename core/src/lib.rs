@@ -7,6 +7,7 @@
 #![no_std]
 
 pub mod civil;
+pub mod docking;
 pub mod journal;
 pub mod policy;
 pub mod rtc;

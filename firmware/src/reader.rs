@@ -386,114 +386,13 @@ pub async fn bringup_scan(
     println!("reader: scan window over");
 }
 
-/// Maps the tags in the field onto each device's `docked` flag.
+/// Docking, with this project's identity types filled in.
 ///
-/// # What happens when the reader fails
-///
-/// A reader that stops answering holds the **last known** docking state rather than
-/// guessing, and reports the fault. Both alternatives are worse: declaring everything
-/// undocked would drain the balance for devices sitting untouched at the reader, which
-/// is the unfairness this whole design exists to avoid; declaring everything docked
-/// would hand out unmetered screen time for as long as the fault lasts. Holding is
-/// wrong in neither direction for the length of a glitch, and the alert is what makes a
-/// long fault visible — detection over prevention, as everywhere else here.
-pub struct Docking {
-    /// Configured UID per device; `None` means fall back to the BOOT button.
-    known: [Option<Uid>; 2],
-    /// Configured ISO 14443A card per device, for the interim before stickers arrive.
-    known_cards: [Option<CardUid>; 2],
-    last: [bool; 2],
-    /// The unknown tag most recently reported, so one strange tag left lying on the
-    /// reader does not produce an alert every second.
-    reported_unknown: Option<Uid>,
-    consecutive_failures: u32,
-}
-
-/// Reader failures tolerated before saying so. At one poll per second this is a few
-/// seconds of silence, which distinguishes a wedged chip from a single bad transfer.
-const FAILURES_BEFORE_ALERT: u32 = 5;
-
-/// What a poll concluded.
-pub struct Docked {
-    pub docked: [bool; 2],
-    /// A tag in the field belonging to no configured device, worth telling the parent
-    /// about — a device carrying someone else's sticker looks exactly like this.
-    pub unknown: Option<Uid>,
-    /// The reader has been unresponsive long enough to be a fault, not a glitch.
-    pub reader_fault: bool,
-}
-
-impl Docking {
-    pub fn new(known: [Option<Uid>; 2], known_cards: [Option<CardUid>; 2]) -> Self {
-        // Start docked, matching the ledger's own fresh-state assumption: until
-        // something is known, do not spend.
-        Self {
-            known,
-            known_cards,
-            last: [true; 2],
-            reported_unknown: None,
-            consecutive_failures: 0,
-        }
-    }
-
-    /// True when no device has any identity configured, so the reader cannot drive
-    /// anything and the BOOT button is still the only input.
-    pub fn unconfigured(&self) -> bool {
-        self.known.iter().all(|k| k.is_none()) && self.known_cards.iter().all(|k| k.is_none())
-    }
-
-    /// Whether a device is identified by a card rather than a sticker.
-    fn card_present(&self, i: usize, card: Option<CardUid>) -> Option<bool> {
-        self.known_cards[i].map(|known| card == Some(known))
-    }
-
-    pub fn update(
-        &mut self,
-        seen: Option<&[Uid]>,
-        card: Option<CardUid>,
-        fallback: [bool; 2],
-    ) -> Docked {
-        let Some(seen) = seen else {
-            self.consecutive_failures += 1;
-            return Docked {
-                docked: self.last,
-                unknown: None,
-                reader_fault: self.consecutive_failures == FAILURES_BEFORE_ALERT,
-            };
-        };
-        self.consecutive_failures = 0;
-
-        let mut docked = [false; 2];
-        for i in 0..2 {
-            // A sticker wins if one is configured; otherwise a card; otherwise the
-            // button. Both can be configured during the changeover, and either being
-            // present counts as put back — so swapping identities needs no flag day.
-            let by_tag = self.known[i].map(|uid| seen.contains(&uid));
-            let by_card = self.card_present(i, card);
-            docked[i] = match (by_tag, by_card) {
-                (Some(a), Some(b)) => a || b,
-                (Some(a), None) => a,
-                (None, Some(b)) => b,
-                (None, None) => fallback[i],
-            };
-        }
-        self.last = docked;
-
-        // Anything in the field that is not a configured device.
-        let unknown = seen
-            .iter()
-            .find(|u| !self.known.iter().any(|k| k.as_ref() == Some(*u)))
-            .copied();
-        let report = match (unknown, self.reported_unknown) {
-            (Some(u), Some(prev)) if u == prev => None,
-            (Some(u), _) => Some(u),
-            (None, _) => None,
-        };
-        self.reported_unknown = unknown;
-
-        Docked { docked, unknown: report, reader_fault: false }
-    }
-}
+/// The logic lives in `medienzeit-core` so it can be tested on the host: every bug it
+/// has had was a logic bug, and twice they were the same one — a reader failure being
+/// passed along as "nothing is in the field", which starts the clock on a device that
+/// never moved.
+pub type Docking = medienzeit_core::docking::Docking<Uid, CardUid, 2>;
 
 /// Format a UID for a message, most significant byte first.
 pub fn uid_hex(uid: &Uid) -> heapless::String<16> {
