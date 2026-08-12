@@ -33,7 +33,7 @@ use medienzeit_ui::Chrome;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const DEV_NAMES: [&str; 2] = [
+pub const DEV_NAMES: [&str; 2] = [
     env!("MEDIENZEIT_FB_DEVICE1_NAME"),
     env!("MEDIENZEIT_FB_DEVICE2_NAME"),
 ];

@@ -133,6 +133,26 @@ pub async fn serve(stack: Stack<'static>) {
         };
         let text = core::str::from_utf8(&req[..n]).unwrap_or("");
 
+        // The stylesheet needs no auth — it carries nothing private, and requiring it
+        // would leave the 401 page unstyled for no gain. Cached hard: it only changes
+        // when the firmware does.
+        if text.starts_with("GET /s.css") {
+            let mut head: String<160> = String::new();
+            let _ = write!(
+                head,
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/css; charset=utf-8\r\n\
+                 Cache-Control: public, max-age=31536000, immutable\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                STYLESHEET.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(STYLESHEET.as_bytes()).await;
+            let _ = sock.flush().await;
+            sock.close();
+            continue;
+        }
+
         let snapshot = latest();
         let response = handle(out, body, text, &auth, snapshot.as_ref());
         let _ = sock.write_all(response.as_bytes()).await;
@@ -141,17 +161,33 @@ pub async fn serve(stack: Stack<'static>) {
     }
 }
 
+/// The stylesheet, in flash rather than in the page buffer.
+///
+/// Kept out of the HTML deliberately. The page is assembled into a fixed RAM buffer, so
+/// an inline `<style>` would spend the scarce resource; as a separate route it is a
+/// `const &str` written straight to the socket, spending the abundant one — 2.3 MB of
+/// free app flash against about a kilobyte of spare buffer.
+const STYLESHEET: &str = include_str!("s.css");
+
 /// Response and body buffers.
 ///
 /// Statics rather than locals: the settings form pushed these past 4 KB together, which
 /// is more than the web task's stack wants to carry. Only one request is handled at a
 /// time, so a single pair is enough.
-static OUT: StaticCell<String<4096>> = StaticCell::new();
-static BODY: StaticCell<String<3072>> = StaticCell::new();
+static OUT: StaticCell<String<8192>> = StaticCell::new();
+static BODY: StaticCell<String<6144>> = StaticCell::new();
+
+/// Warn before the page silently loses its tail.
+///
+/// `heapless` truncates rather than failing, and the states that push the page longest —
+/// a grant confirmation and a save confirmation together — are exactly the ones a parent
+/// is looking at when it matters. The measured page is about 3 KB, so this leaves room
+/// for the copy to grow without anyone watching the byte count.
+const BODY_WARN_AT: usize = 5 * 6144 / 6;
 
 fn handle<'b>(
-    out: &'b mut String<4096>,
-    body: &mut String<3072>,
+    out: &'b mut String<8192>,
+    body: &mut String<6144>,
     request: &str,
     expected_auth: &str,
     snap: Option<&Snapshot<2>>,
@@ -193,6 +229,9 @@ fn handle<'b>(
     }
 
     page(body, snap, granted, saved);
+    if body.len() >= BODY_WARN_AT {
+        println!("web: page is {} bytes, buffer is {}", body.len(), body.capacity());
+    }
 
     let _ = write!(
         out,
@@ -280,115 +319,172 @@ fn parse_settings(request: &str) -> Option<Settings> {
     Some(s)
 }
 
+/// The four corner registration marks every framed block carries.
+///
+/// Static decoration from the design system, with no data in it, so it is emitted as a
+/// literal wherever a `.bp` block opens.
+const CORNERS: &str =
+    "<i class=tl></i><i class=tr></i><i class=bl></i><i class=br></i>";
+
 fn page(
-    out: &mut String<3072>,
+    out: &mut String<6144>,
     snap: Option<&Snapshot<2>>,
     granted: u32,
     saved: Option<bool>,
 ) {
     let _ = out.push_str(
-        "<!doctype html><meta charset=utf-8>\
+        "<!doctype html><html lang=de><head><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
-         <title>Medienzeit</title>\
-         <style>body{font:16px system-ui;margin:2rem;max-width:24rem}\
-         .b{font-size:3rem;font-weight:700;margin:.2em 0}\
-         table{border-collapse:collapse;width:100%}td{padding:.3em 0}\
-         td+td{text-align:right}\
-         button{font-size:1.1rem;padding:.6em 1.2em;margin:.2em}</style>",
+         <title>Medienzeit</title><link rel=stylesheet href=/s.css></head>\
+         <body><main><h1>Medienzeit</h1>",
     );
 
+    // --- balance --------------------------------------------------------------
+    let _ = write!(out, "<div class=\"plate bp\">{CORNERS}<p class=kicker>Saldo</p>");
     match snap {
         None => {
-            let _ = out.push_str("<p>Starting up — no state yet.</p>");
+            let _ = out.push_str("<p class=balance><strong>—</strong></p>\
+                                  <p class=stale-note>Startet — noch kein Stand.</p>");
         }
         Some(s) => {
-            let mins = s.balance_secs / 60;
-            let _ = write!(out, "<div class=b>{mins} min</div>");
+            // A grant is applied by the control loop on its next tick, so the number
+            // here is briefly the old one. Dimming it and saying so beats looking like
+            // the button did nothing.
             let _ = write!(
                 out,
-                "<table>\
-                 <tr><td>Status</td><td>{}</td></tr>\
-                 <tr><td>Time</td><td>{:02}:{:02}</td></tr>\
-                 <tr><td>Night</td><td>{}</td></tr>\
-                 <tr><td>Device 1</td><td>{} / {}</td></tr>\
-                 <tr><td>Device 2</td><td>{} / {}</td></tr>\
-                 </table>",
-                match s.flow {
-                    Flow::Filling => "charging",
-                    Flow::Draining => "running",
-                    Flow::Held => "held",
-                },
-                s.local.hour,
-                s.local.minute,
-                yes_no(s.night),
-                put_back(s.docked[0]),
-                blocked(s.blocked[0]),
-                put_back(s.docked[1]),
-                blocked(s.blocked[1]),
+                "<p class=balance{}><strong>{}</strong><span class=unit>Min</span></p>",
+                if granted > 0 { " data-stale=true" } else { "" },
+                s.balance_secs / 60
             );
+            if granted > 0 {
+                let _ = write!(
+                    out,
+                    "<p class=stale-note>+{granted} Min gewährt — der Saldo oben braucht \
+                     einen Moment.</p>"
+                );
+            }
         }
     }
+    let _ = out.push_str("</div>");
 
-    // Alerting health. A push channel nobody checks is a push channel that has been
-    // broken for a month, so make its state impossible to miss on the page you
-    // actually open.
+    // --- the hurried path -----------------------------------------------------
+    let _ = write!(
+        out,
+        "<form class=bonus-form method=post action=/>\
+         <button class=\"bonus-btn bp\" type=submit name=grant value=10>{CORNERS}+10 Min</button>\
+         <button class=\"bonus-btn bp\" type=submit name=grant value=30>{CORNERS}+30 Min</button>\
+         </form>"
+    );
+
+    // --- status ---------------------------------------------------------------
+    if let Some(s) = snap {
+        let _ = write!(
+            out,
+            "<div class=\"status-wrap bp\">{CORNERS}<table class=status>\
+             <thead><tr><th>Feld</th><th colspan=2>Wert</th></tr></thead><tbody>\
+             <tr><th scope=row>Status</th><td colspan=2>{}</td></tr>\
+             <tr><th scope=row>Uhrzeit</th><td colspan=2>{:02}:{:02}</td></tr>\
+             <tr><th scope=row>Nacht</th><td colspan=2>{}</td></tr>",
+            match s.flow {
+                Flow::Filling => "füllt sich",
+                Flow::Draining => "läuft",
+                Flow::Held => "gehalten",
+            },
+            s.local.hour,
+            s.local.minute,
+            yes_no(s.night),
+        );
+        for i in 0..2 {
+            let _ = write!(
+                out,
+                "<tr><th scope=row>{}</th><td>{}</td><td{}>{}</td></tr>",
+                crate::DEV_NAMES[i],
+                put_back(s.docked[i]),
+                if s.blocked[i] { " data-state=blocked" } else { "" },
+                blocked(s.blocked[i]),
+            );
+        }
+        let _ = out.push_str("</tbody></table></div>");
+    }
+
+    // --- alerting health ------------------------------------------------------
+    //
+    // On the page deliberately: a push channel nobody checks is a push channel that has
+    // been broken for a month, and silence from it looks exactly like good behaviour.
     let h = crate::notify::health();
     if h.failed_in_a_row > 0 {
         let _ = write!(
             out,
-            "<p style=\"color:#b00\"><b>Alerts failing</b> — {} in a row, {} sent overall.</p>",
-            h.failed_in_a_row, h.sent
+            "<p class=\"alert-health is-failing\">Benachrichtigungen: {} Fehlversuche \
+             in Folge</p>",
+            h.failed_in_a_row
         );
     } else if h.last_ok_ms.is_none() {
-        let _ = out.push_str("<p style=\"color:#666\">No alert sent yet this session.</p>");
+        let _ = out.push_str(
+            "<p class=alert-health>Benachrichtigungen: noch keine gesendet</p>",
+        );
     } else {
-        let _ = write!(out, "<p style=\"color:#666\">Alerts OK — {} sent.</p>", h.sent);
+        let _ = write!(
+            out,
+            "<p class=alert-health>Benachrichtigungen: in Ordnung · {} gesendet</p>",
+            h.sent
+        );
     }
 
-    if granted > 0 {
-        // The control loop applies this on its next tick, so the number above is
-        // still the old one. Say so rather than looking like the button did nothing.
-        let _ = write!(out, "<p><b>+{granted} min granted</b> — applies within a second.</p>");
-    }
-
-    let _ = out.push_str(
-        "<form method=post>\
-         <button name=grant value=10>+10 min</button>\
-         <button name=grant value=30>+30 min</button>\
-         </form>",
+    // --- the deliberate path --------------------------------------------------
+    let Some(c) = current_settings() else {
+        let _ = out.push_str("</main></body></html>");
+        return;
+    };
+    // Left open after a submission, so the result is visible where the change was made
+    // rather than hidden behind a disclosure that has snapped shut.
+    let _ = write!(
+        out,
+        "<div class=\"rules-wrap bp\">{CORNERS}<details class=rules{}>\
+         <summary>Regeln</summary><div class=rules-body>",
+        if saved.is_some() { " open" } else { "" }
     );
-
     match saved {
         Some(true) => {
-            let _ = out.push_str("<p><b>Settings saved.</b></p>");
+            let _ = out.push_str("<p class=saved-note>Gespeichert.</p>");
         }
         Some(false) => {
             let _ = out.push_str(
-                "<p style=\"color:#b00\"><b>Settings refused</b> — a refill divisor of \
-                 zero, or a time outside the clock.</p>",
+                "<p class=\"saved-note is-failing\">Abgelehnt — Teiler 0 oder eine \
+                 Uhrzeit außerhalb des Tages.</p>",
             );
         }
         None => {}
     }
-
-    let Some(c) = current_settings() else { return };
     // Times are shown in the local clock the ledger uses, so what is typed here and what
     // the night rule does are the same numbers.
     let _ = write!(
         out,
-        "<h3>Rules</h3><form method=post><table>\
-         <tr><td>Earn</td><td><input type=number name=rn value={} min=1 max=100 style=width:4em> \
-         per <input type=number name=rd value={} min=1 max=100 style=width:4em> min away</td></tr>\
-         <tr><td>Most it can hold</td><td><input type=number name=cap value={} min=0 max=1440 style=width:5em> min</td></tr>\
-         <tr><td>Debt allowed</td><td><input type=number name=floor value={} min=0 max=1440 style=width:5em> min</td></tr>\
-         <tr><td>Fresh start</td><td><input type=number name=pre value={} min=0 max=1440 style=width:5em> min</td></tr>\
-         <tr><td>Free pickup</td><td><input type=number name=grace value={} min=0 max=3600 style=width:5em> s</td></tr>\
-         <tr><td>Night from</td><td><input type=time name=ns value=\"{:02}:{:02}\"></td></tr>\
-         <tr><td>Night until</td><td><input type=time name=ne value=\"{:02}:{:02}\"></td></tr>\
-         </table><button type=submit>Save rules</button></form>\
-         <p style=\"color:#666\">Changes apply at once and survive a restart. \
-         The balance itself is not touched — a smaller cap trims it on the next tick, \
-         a bigger one just leaves room.</p>",
+        "<form method=post action=/>\
+         <p class=earn-row>\
+         <label class=visually-hidden for=rn>Verdient, Minuten</label>\
+         Verdient <input type=number id=rn name=rn value={} min=0 inputmode=numeric> Min je \
+         <label class=visually-hidden for=rd>je Minuten weggenommen</label>\
+         <input type=number id=rd name=rd value={} min=1 inputmode=numeric> Min weggenommen</p>\
+         <div class=rule-row><label for=cap>Höchststand</label>\
+         <span><input type=number id=cap name=cap value={} min=0 inputmode=numeric>\
+         <span class=unit-hint>Min</span></span></div>\
+         <div class=rule-row><label for=floor>Erlaubtes Minus</label>\
+         <span><input type=number id=floor name=floor value={} min=0 inputmode=numeric>\
+         <span class=unit-hint>Min</span></span></div>\
+         <div class=rule-row><label for=pre>Startguthaben</label>\
+         <span><input type=number id=pre name=pre value={} min=0 inputmode=numeric>\
+         <span class=unit-hint>Min</span></span></div>\
+         <div class=rule-row><label for=grace>Karenzzeit</label>\
+         <span><input type=number id=grace name=grace value={} min=0 inputmode=numeric>\
+         <span class=unit-hint>Sek</span></span></div>\
+         <div class=rule-row><label for=ns>Nacht ab</label>\
+         <input type=time id=ns name=ns value=\"{:02}:{:02}\"></div>\
+         <div class=rule-row><label for=ne>Nacht bis</label>\
+         <input type=time id=ne name=ne value=\"{:02}:{:02}\"></div>\
+         <button class=save-btn type=submit>Speichern</button></form>\
+         <p class=explainer>Änderungen wirken sofort und werden dauerhaft gespeichert.</p>\
+         </div></details></div></main></body></html>",
         c.refill_num,
         c.refill_den,
         c.cap_secs / 60,
@@ -404,22 +500,26 @@ fn page(
 
 fn yes_no(b: bool) -> &'static str {
     if b {
-        "yes"
+        "ja"
     } else {
-        "no"
+        "nein"
     }
 }
+
+/// "zurückgelegt" is the chosen word for a device at the reader and is not to be
+/// substituted — it is the term the household uses.
 fn put_back(docked: bool) -> &'static str {
     if docked {
-        "put back"
+        "zurückgelegt"
     } else {
-        "taken away"
+        "weggenommen"
     }
 }
+
 fn blocked(b: bool) -> &'static str {
     if b {
-        "blocked"
+        "blockiert"
     } else {
-        "allowed"
+        "erlaubt"
     }
 }

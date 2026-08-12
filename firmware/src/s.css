@@ -1,0 +1,165 @@
+/* Medienzeit admin page — stylesheet, styled to the Industry design system
+   (steel-blue blueprint aesthetic). Plain CSS, no imports, no external
+   resources — Industry's Google Font is dropped (hard constraint: nothing
+   external), everything else is carried over as literal tokens: colors,
+   the square-cornered "blueprint" frame with corner registration marks,
+   and one solid accent-filled primary action.
+   Served from its own route (GET /s.css) with a long Cache-Control, so it
+   lives in flash rather than the per-request page buffer.
+   Zero JS: the rules disclosure is native <details>.
+
+   The demo-only theme switch and reference appendix from the design source
+   are dropped here — the generator never emits those elements. */
+
+/* ---------- tokens (light = Industry's own values) ---------- */
+:root{
+  --color-bg:#f2f2f3;
+  --color-surface:#e9e9ea;
+  --color-text:#1d1f20;
+  --color-text-dim:color-mix(in srgb, var(--color-text) 55%, transparent);
+  --color-divider:color-mix(in srgb, var(--color-text) 16%, transparent);
+  --color-accent:#5980a6;
+  --color-accent-600:#597ea3;
+  --color-accent-700:#416180;
+  --color-accent-100:#eef6ff;
+  --color-danger:oklch(54% 0.17 25);
+  --color-danger-bg:oklch(96% 0.03 25);
+}
+/* dark ground, same accent hue family, carried in oklch */
+@media (prefers-color-scheme:dark){
+  :root{
+    --color-bg:oklch(20% 0.006 235);
+    --color-surface:oklch(25% 0.008 235);
+    --color-text:oklch(92% 0.004 235);
+    --color-accent:oklch(72% 0.08 235);
+    --color-accent-600:oklch(65% 0.09 235);
+    --color-accent-700:oklch(58% 0.1 235);
+    --color-accent-100:oklch(30% 0.02 235);
+    --color-danger:oklch(70% 0.16 25);
+    --color-danger-bg:oklch(28% 0.05 25);
+  }
+}
+
+/* ---------- reset & base ---------- */
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:var(--color-bg);
+  color:var(--color-text);
+  /* Industry pairs Barlow Condensed / Barlow; both are Google Fonts and the
+     device may have no internet, so headings lean on weight + tracking on
+     the system stack instead of an actual condensed face. */
+  font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  -webkit-text-size-adjust:100%;
+}
+main{max-width:480px;margin:0 auto;padding:20px 20px 48px}
+p{margin:0}
+::selection{background:color-mix(in srgb, var(--color-accent) 30%, transparent)}
+:focus{outline:none}
+:focus-visible{outline:2px solid var(--color-accent);outline-offset:2px}
+
+h1{
+  font-size:15px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--color-text);margin:0 0 20px;padding-bottom:12px;
+  border-bottom:1px solid var(--color-divider);
+}
+.kicker{
+  font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--color-accent);margin:0 0 4px;
+}
+
+/* ---------- blueprint frame: hairline border + "+" corner marks ---------- */
+.bp{position:relative;border:1px solid var(--color-divider)}
+.bp>i{position:absolute;width:10px;height:10px;color:color-mix(in srgb, var(--color-text) 45%, transparent)}
+.bp>i::before,.bp>i::after{content:"";position:absolute;background:currentColor}
+.bp>i::before{left:4px;top:0;width:1px;height:100%}
+.bp>i::after{top:4px;left:0;width:100%;height:1px}
+.bp>i.tl{top:-5px;left:-5px}
+.bp>i.tr{top:-5px;right:-5px}
+.bp>i.bl{bottom:-5px;left:-5px}
+.bp>i.br{bottom:-5px;right:-5px}
+
+/* ---------- balance plate ---------- */
+.plate{padding:16px 16px 18px;margin:0 0 24px}
+.balance{
+  display:flex;align-items:baseline;gap:8px;
+  font-variant-numeric:tabular-nums;transition:opacity .15s;
+}
+.balance strong{font-size:60px;font-weight:700;line-height:1;letter-spacing:-.01em}
+.balance .unit{font-size:18px;font-weight:500;color:var(--color-text-dim)}
+.balance[data-stale="true"]{opacity:.5}
+.stale-note{margin:8px 0 0;font-size:13px;color:var(--color-text-dim)}
+
+/* ---------- bonus buttons: the one solid-filled object on the page ---------- */
+.bonus-form{display:flex;gap:12px;margin:0 0 28px}
+.bonus-btn{
+  position:relative;flex:1;min-height:64px;
+  border:1px solid var(--color-accent);border-radius:0;
+  background:var(--color-accent);color:var(--color-bg);
+  font:inherit;font-size:19px;font-weight:700;letter-spacing:.01em;cursor:pointer;
+}
+.bonus-btn:hover{background:var(--color-accent-600)}
+.bonus-btn:active{background:var(--color-accent-700)}
+.bonus-btn>i{color:color-mix(in srgb, var(--color-bg) 55%, transparent)}
+
+/* ---------- status table ---------- */
+.status-wrap{margin:0 0 20px;padding:2px}
+.status{width:100%;border-collapse:collapse;font-size:14px}
+.status th,.status td{text-align:left;padding:10px 12px;font-weight:400}
+.status thead th{
+  font-size:10px;letter-spacing:.08em;text-transform:uppercase;font-weight:700;
+  color:var(--color-text-dim);border-bottom:1px solid var(--color-divider);
+}
+.status tbody tr+tr td,.status tbody tr+tr th{border-top:1px solid var(--color-divider)}
+.status td[data-state="blocked"]{color:var(--color-text-dim)}
+
+/* ---------- alert health ---------- */
+.alert-health{margin:0 0 28px;font-size:13px;color:var(--color-text-dim)}
+.alert-health.is-failing{
+  font-size:15px;font-weight:700;color:var(--color-danger);background:var(--color-danger-bg);
+  padding:12px 14px;border:1px solid var(--color-danger);
+}
+
+/* ---------- rules (deliberate path) ---------- */
+.rules-wrap{margin:0 0 12px;padding:2px}
+details.rules{background:transparent}
+details.rules summary{
+  cursor:pointer;padding:14px;font-weight:700;font-size:13px;
+  letter-spacing:.06em;text-transform:uppercase;list-style:none;
+}
+details.rules summary::-webkit-details-marker{display:none}
+details.rules summary::after{content:"anzeigen";float:right;font-weight:400;text-transform:none;letter-spacing:0;color:var(--color-accent);font-size:13px}
+details.rules[open] summary::after{content:"ausblenden"}
+.rules-body{padding:4px 14px 16px}
+
+.rule-row{
+  display:grid;grid-template-columns:1fr auto;align-items:center;gap:10px 12px;
+  padding:10px 0;border-top:1px solid var(--color-divider);
+}
+.rule-row:first-child{border-top:none}
+.rule-row label{font-size:14px}
+.rule-row input[type="number"],.rule-row input[type="time"]{
+  width:88px;padding:7px 8px;font:inherit;font-size:14px;font-variant-numeric:tabular-nums;
+  color:var(--color-text);background:var(--color-surface);
+  border:1px solid var(--color-divider);border-radius:0;text-align:right;
+}
+.rule-row .unit-hint{font-size:12px;color:var(--color-text-dim);margin-left:6px}
+
+.earn-row{padding:10px 0;border-top:none;font-size:14px}
+.visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.earn-row input[type="number"]{
+  width:52px;padding:6px;font:inherit;font-size:14px;font-variant-numeric:tabular-nums;text-align:center;
+  color:var(--color-text);background:var(--color-surface);border:1px solid var(--color-divider);border-radius:0;margin:0 4px;
+}
+
+.save-btn{
+  width:100%;margin-top:6px;padding:12px;border:1px solid var(--color-accent);border-radius:0;
+  background:var(--color-accent);color:var(--color-bg);font:inherit;font-size:14px;font-weight:700;
+  letter-spacing:.04em;text-transform:uppercase;cursor:pointer;
+}
+.save-btn:hover{background:var(--color-accent-600)}
+.save-btn:active{background:var(--color-accent-700)}
+
+.explainer{margin:12px 0 0;font-size:12.5px;line-height:1.5;color:var(--color-text-dim)}
+.saved-note{margin:0 0 10px;font-size:13px;font-weight:700;color:var(--color-accent)}
+.saved-note.is-failing{color:var(--color-danger)}
