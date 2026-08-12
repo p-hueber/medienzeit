@@ -137,8 +137,11 @@ pub async fn serve(stack: Stack<'static>) {
         // would leave the 401 page unstyled for no gain. Cached hard: it only changes
         // when the firmware does.
         if text.starts_with("GET /s.css") {
+            // Checked rather than discarded: `write!` into a heapless String truncates
+            // instead of failing, so an over-long header goes out as a malformed
+            // response with an empty body and nothing logged anywhere.
             let mut head: String<160> = String::new();
-            let _ = write!(
+            let built = write!(
                 head,
                 "HTTP/1.1 200 OK\r\n\
                  Content-Type: text/css; charset=utf-8\r\n\
@@ -146,6 +149,11 @@ pub async fn serve(stack: Stack<'static>) {
                  Content-Length: {}\r\nConnection: close\r\n\r\n",
                 STYLESHEET.len()
             );
+            if built.is_err() {
+                println!("web: stylesheet header did not fit, refusing to send it");
+                sock.close();
+                continue;
+            }
             let _ = sock.write_all(head.as_bytes()).await;
             let _ = sock.write_all(STYLESHEET.as_bytes()).await;
             let _ = sock.flush().await;
