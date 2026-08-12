@@ -55,10 +55,6 @@ pub mod reg {
     pub const RX_STATUS: u8 = 0x13;
     /// Bits 26:24 are the transceive state.
     pub const RF_STATUS: u8 = 0x1d;
-    /// Bit 0 enables the receiver's CRC check.
-    pub const CRC_RX_CONFIG: u8 = 0x12;
-    /// Bit 0 enables the transmitter's CRC.
-    pub const CRC_TX_CONFIG: u8 = 0x19;
     /// Transmitter framing. Clearing bits 6, 7 and 10 makes it send a bare EOF.
     pub const TX_CONFIG: u8 = 0x18;
 }
@@ -72,10 +68,6 @@ const TS_IDLE: u32 = 0;
 /// only an EOF. That is how an ISO 15693 anticollision round steps to the next slot:
 /// a zero-length `SEND_DATA` on its own transmits nothing at all.
 const TX_CONFIG_EOF_ONLY: u32 = 0xffff_fb3f;
-
-/// Requests per poll before a card counts as absent. Cheap: each is a ~20 ms timeout,
-/// and only a genuinely absent card pays the full cost.
-const CARD_ATTEMPTS: u32 = 3;
 
 /// Extract the transceive state from `RF_STATUS`.
 pub fn transceive_state(rf_status: u32) -> u32 {
@@ -207,69 +199,6 @@ pub fn parse_inventory_response(buf: &[u8]) -> Option<Uid> {
     }
     Some(Uid(uid))
 }
-
-/// An ISO 14443A 4-byte card identifier, in the order the card sends it — which is also
-/// the order it is printed.
-///
-/// A separate type from [`Uid`] on purpose. These are a different protocol, they are
-/// four bytes not eight, and 4-byte card UIDs are **not** reliably unique across cheap
-/// batches. Keeping them distinct means the two can never be compared or confused, and
-/// the weaker guarantee stays visible in the type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CardUid(pub [u8; 4]);
-
-impl CardUid {
-    /// Parse from printed hex, most significant byte first. Separators are ignored.
-    pub fn from_hex(s: &str) -> Option<Self> {
-        let mut bytes = [0u8; 4];
-        let mut n = 0;
-        let mut hi: Option<u8> = None;
-        for c in s.chars() {
-            if matches!(c, ':' | '-' | ' ' | '_') {
-                continue;
-            }
-            let d = c.to_digit(16)? as u8;
-            match hi {
-                None => hi = Some(d),
-                Some(h) => {
-                    if n == 4 {
-                        return None;
-                    }
-                    bytes[n] = (h << 4) | d;
-                    n += 1;
-                    hi = None;
-                }
-            }
-        }
-        if n != 4 || hi.is_some() {
-            return None;
-        }
-        Some(CardUid(bytes))
-    }
-}
-
-/// Decode an ISO 14443A anticollision response: four UID bytes then the BCC.
-///
-/// The BCC is an XOR checksum over the UID, and checking it is the only guard against a
-/// misframed read here — unlike ISO 15693 there is no `0xE0` prefix to sanity-check, so
-/// without it any five bytes would be accepted as an identity.
-pub fn parse_anticollision(buf: &[u8]) -> Option<CardUid> {
-    if buf.len() < 5 {
-        return None;
-    }
-    let uid = [buf[0], buf[1], buf[2], buf[3]];
-    if uid[0] ^ uid[1] ^ uid[2] ^ uid[3] != buf[4] {
-        return None;
-    }
-    // 0x88 is the cascade tag, meaning this is really a 7- or 10-byte UID and what we
-    // have is only its first fragment. Accepting it would key a device on a partial
-    // identity that a second cascade level would contradict.
-    if uid[0] == 0x88 {
-        return None;
-    }
-    Some(CardUid(uid))
-}
-
 
 /// Smooths tag presence over consecutive inventory rounds.
 ///
@@ -583,16 +512,11 @@ where
     /// Transmit a frame. `data` may be empty, which sends a bare EOF — that is how
     /// ISO 15693 advances to the next anticollision slot.
     fn send_data(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.send_data_bits(data, 0)
-    }
-
-    /// As [`Self::send_data`], but with an explicit count of valid bits in the final
-    /// byte. ISO 14443A's short frames need 7, which is the only reason this exists.
-    fn send_data_bits(&mut self, data: &[u8], valid_bits: u8) -> Result<(), Error> {
         self.begin_transceive()?;
+        // Command, then "number of valid bits in the last byte", 0 meaning all eight.
         let mut frame = [0u8; 2 + MAX_FRAME];
         frame[0] = cmd::SEND_DATA;
-        frame[1] = valid_bits;
+        frame[1] = 0;
         frame[2..2 + data.len()].copy_from_slice(data);
         self.send(&frame[..2 + data.len()])
     }
@@ -631,19 +555,20 @@ where
         self.begin_protocol(0x0d, 0x8d)
     }
 
-    /// Switch the front end to a protocol, from a known state.
-    ///
-    /// Reconfiguring while the field is up and the transceiver mid-flight wedges the
-    /// state machine: every subsequent `begin_transceive` times out waiting for
-    /// WaitTransmit, in *both* protocols, until a reset. Observed when alternating
-    /// ISO 15693 and ISO 14443A once a second. Dropping the field and returning the
-    /// command field to Idle first is what makes the switch survivable.
     /// How many times the transceiver has needed recovering. Worth surfacing: a rising
     /// count means the RF front end is unhappy even though reads still succeed.
     pub fn recoveries(&self) -> u32 {
         self.recoveries
     }
 
+    /// Configure the front end for a protocol, from a known state.
+    ///
+    /// Reconfiguring while the field is up and the transceiver mid-flight wedges the
+    /// state machine: every subsequent `begin_transceive` times out waiting for
+    /// WaitTransmit until something resets it. Found while a second protocol was
+    /// briefly supported and the two were alternated once a second; that support is
+    /// gone, but the recovery path still calls this, so the careful sequence stays —
+    /// drop the field, return the command field to Idle, then load and re-energise.
     pub fn begin_protocol(&mut self, tx: u8, rx: u8) -> Result<(), Error> {
         self.protocol = Some((tx, rx));
         self.write_register_and_mask(reg::SYSTEM_CONFIG, 0xffff_fff8)?;
@@ -682,88 +607,6 @@ where
                 Ok(len)
             }
         }
-    }
-
-    /// Diagnostic only: send an ISO 14443A `REQA` and return the card's ATQA.
-    ///
-    /// This project needs ISO 15693 for its range, not 14443A. The value here is purely
-    /// as a control: a card answering `REQA` proves the antenna radiates and the receive
-    /// path works, which separates "the reader is broken" from "that tag speaks a
-    /// different protocol" — indistinguishable otherwise, since both are silence.
-    pub fn probe_iso14443a(&mut self) -> Result<Option<[u8; 2]>, Error> {
-        self.begin_iso14443a()?;
-        self.reqa_or_wupa(0x26)
-    }
-
-    /// Configure the front end for ISO 14443A and switch the field on.
-    ///
-    /// Called once, like [`Self::begin_iso15693`]. Reconfiguring per poll would cycle
-    /// the field every second, which both costs read reliability — a passive card needs
-    /// time in the field to power up — and risks wedging the transceiver.
-    pub fn begin_iso14443a(&mut self) -> Result<(), Error> {
-        self.begin_protocol(0x00, 0x80)?;
-        // ISO 14443A's short frames carry no CRC in either direction.
-        self.write_register_and_mask(reg::CRC_TX_CONFIG, 0xffff_fffe)?;
-        self.write_register_and_mask(reg::CRC_RX_CONFIG, 0xffff_fffe)
-    }
-
-    /// `REQA` (0x26) or `WUPA` (0x52), returning the card's ATQA.
-    ///
-    /// Repeat polling must use WUPA. A card that has been through anticollision is no
-    /// longer in IDLE, and only WUPA wakes it from there — poll with REQA and the card
-    /// answers once and then appears to vanish while sitting on the coil.
-    fn reqa_or_wupa(&mut self, cmd: u8) -> Result<Option<[u8; 2]>, Error> {
-        self.clear_irqs()?;
-        // Seven valid bits: these are short frames.
-        self.send_data_bits(&[cmd], 7)?;
-        match self.await_frame(20_000)? {
-            Some(len) if len >= 2 => {
-                let mut atqa = [0u8; 2];
-                self.read_data(&mut atqa)?;
-                Ok(Some(atqa))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// Identify a single ISO 14443A card: `REQA`, then one anticollision level.
-    ///
-    /// Deliberately no anticollision *loop* — one card at a time is all this is for, as
-    /// an interim while the ISO 15693 stickers are in the post. Two cards in the field
-    /// will collide and read as nothing, which is the safe way to fail: no identity
-    /// rather than a wrong one.
-    ///
-    /// Reconfigures the front end on every call, and uses `REQA` rather than `WUPA`.
-    ///
-    /// Both look wasteful and both are deliberate. This exact sequence read a card
-    /// reliably on the bench; replacing it with one-time setup plus `WUPA` — two changes
-    /// at once — wedged the transceiver on most polls and never recovered. Cycling the
-    /// field per poll evidently resets something that returning the command field to
-    /// Idle does not. Change one of these at a time, and verify against a real card.
-    pub fn iso14443a_uid(&mut self) -> Result<Option<CardUid>, Error> {
-        self.begin_iso14443a()?;
-        // Several attempts before concluding the card is gone. The field is cycled once
-        // per poll, so a card sitting perfectly still has to power up from cold every
-        // time, and it does not always make the first request. One attempt per poll made
-        // a stationary card appear to come and go.
-        for _ in 0..CARD_ATTEMPTS {
-            if self.reqa_or_wupa(0x26)?.is_none() {
-                continue;
-            }
-            // ANTICOLLISION, cascade level 1: 0x93 0x20, no CRC, whole bytes.
-            self.clear_irqs()?;
-            self.send_data_bits(&[0x93, 0x20], 0)?;
-            if let Some(len) = self.await_frame(20_000)? {
-                if len >= 5 {
-                    let mut buf = [0u8; 5];
-                    self.read_data(&mut buf)?;
-                    if let Some(uid) = parse_anticollision(&buf) {
-                        return Ok(Some(uid));
-                    }
-                }
-            }
-        }
-        Ok(None)
     }
 
     /// Find every tag in the field, with anticollision.
@@ -954,40 +797,6 @@ mod tests {
         out
     }
 
-
-    #[test]
-    fn decodes_a_card_uid() {
-        // BCC is the XOR of the four UID bytes.
-        let uid = parse_anticollision(&[0xde, 0xad, 0xbe, 0xef, 0xde ^ 0xad ^ 0xbe ^ 0xef]);
-        assert_eq!(uid, Some(CardUid([0xde, 0xad, 0xbe, 0xef])));
-    }
-
-    #[test]
-    fn rejects_a_bad_bcc() {
-        assert_eq!(parse_anticollision(&[0xde, 0xad, 0xbe, 0xef, 0x00]), None);
-    }
-
-    #[test]
-    fn rejects_a_short_anticollision_frame() {
-        assert_eq!(parse_anticollision(&[0xde, 0xad, 0xbe, 0xef]), None);
-    }
-
-    /// A cascade tag means the real UID is longer than what we have. Keying a device on
-    /// the fragment would be keying it on something no card actually reports.
-    #[test]
-    fn rejects_the_cascade_tag() {
-        let bcc = 0x88u8 ^ 0x01 ^ 0x02 ^ 0x03;
-        assert_eq!(parse_anticollision(&[0x88, 0x01, 0x02, 0x03, bcc]), None);
-    }
-
-    #[test]
-    fn parses_a_printed_card_uid() {
-        assert_eq!(CardUid::from_hex("deadbeef"), Some(CardUid([0xde, 0xad, 0xbe, 0xef])));
-        assert_eq!(CardUid::from_hex("DE:AD:BE:EF"), Some(CardUid([0xde, 0xad, 0xbe, 0xef])));
-        for bad in ["", "deadbe", "deadbeef00", "deadbeeg"] {
-            assert_eq!(CardUid::from_hex(bad), None, "{bad:?}");
-        }
-    }
 
 
     fn uid(n: u8) -> Uid {

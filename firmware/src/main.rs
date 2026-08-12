@@ -124,33 +124,14 @@ async fn main(spawner: Spawner) {
     );
     reader::identify(&mut nfc);
     let mut scan = reader::Scan::default();
-    let cards = env!("MEDIENZEIT_PROTOCOL") == "iso14443a";
-    println!("reader: protocol {}", env!("MEDIENZEIT_PROTOCOL"));
-    reader::start_rf(&mut nfc, cards);
+    reader::start_rf(&mut nfc);
 
     // Tags are configured by UID in tags.toml. An unset value leaves that device on the
     // BOOT-button fallback, so the firmware is useful before the tags physically arrive.
-    let docking = reader::Docking::new(
-        [
+    let docking = reader::Docking::new([
             medienzeit_pn5180::Uid::from_display_hex(env!("MEDIENZEIT_TAG_DEVICE1")),
             medienzeit_pn5180::Uid::from_display_hex(env!("MEDIENZEIT_TAG_DEVICE2")),
-        ],
-        [
-            medienzeit_pn5180::CardUid::from_hex(env!("MEDIENZEIT_CARD_DEVICE1")),
-            medienzeit_pn5180::CardUid::from_hex(env!("MEDIENZEIT_CARD_DEVICE2")),
-        ],
-    );
-    for (i, raw) in [
-        env!("MEDIENZEIT_CARD_DEVICE1"),
-        env!("MEDIENZEIT_CARD_DEVICE2"),
-    ]
-    .iter()
-    .enumerate()
-    {
-        if !raw.is_empty() && medienzeit_pn5180::CardUid::from_hex(raw).is_none() {
-            println!("reader: tags.toml device{} card UID {raw:?} is not valid", i + 1);
-        }
-    }
+    ]);
     for (i, raw) in [
         env!("MEDIENZEIT_TAG_DEVICE1"),
         env!("MEDIENZEIT_TAG_DEVICE2"),
@@ -170,12 +151,12 @@ async fn main(spawner: Spawner) {
         println!("reader: no tag UIDs configured — using the BOOT button");
         // Only worth a scan window when there is nothing to match against: it is how the
         // UIDs get read off in the first place.
-        reader::bringup_scan(&mut nfc, &mut scan, 20, cards).await;
+        reader::bringup_scan(&mut nfc, &mut scan, 20).await;
     }
 
     // From here the reader belongs to its own task; the control loop only reads the
     // docking state it publishes.
-    spawner.spawn(reader::task(nfc, docking, cards, boot_button).unwrap());
+    spawner.spawn(reader::task(nfc, docking, boot_button).unwrap());
 
     // Recover the balance before anything else can spend it.
     let (mut journal, recovered) = storage::Journal::open(p.FLASH);

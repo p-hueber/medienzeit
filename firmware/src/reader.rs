@@ -55,7 +55,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use core::cell::RefCell;
 use esp_println::{print, println};
-use medienzeit_pn5180::{CardUid, Pn5180, TagSet, Uid};
+use medienzeit_pn5180::{Pn5180, TagSet, Uid};
 
 /// Most tags we expect in the field at once. Two devices, plus slack so a stray tag
 /// shows up in the log rather than being silently dropped.
@@ -200,14 +200,7 @@ pub fn identify(reader: &mut Reader<'static>) {
 /// Reports `RF_STATUS` either side of each step. Which bit means "transmitter on" is
 /// then a measurement rather than a guess at the datasheet's bit map — and if no bit
 /// changes across `RF_ON`, the field never came up and no tag can possibly answer.
-pub fn start_rf(reader: &mut Reader<'static>, cards: bool) {
-    if cards {
-        match reader.begin_iso14443a() {
-            Ok(()) => println!("reader: ISO 14443A field on"),
-            Err(e) => println!("reader: could not start ISO 14443A ({e:?})"),
-        }
-        return;
-    }
+pub fn start_rf(reader: &mut Reader<'static>) {
     // Drop the field first, so TX_RFON_IRQ afterwards means something. RF_ON on a field
     // that is already up raises no interrupt, which reads as a dead transmitter.
     let _ = reader.field_off();
@@ -356,31 +349,10 @@ impl Scan {
 /// the reader sits behind DHCP and SNTP, so a flaky association would otherwise mean the
 /// antenna is never even asked. Reader faults should not be diagnosed through the
 /// network's availability.
-pub async fn bringup_scan(
-    reader: &mut Reader<'static>,
-    scan: &mut Scan,
-    secs: u32,
-    cards: bool,
-) {
+pub async fn bringup_scan(reader: &mut Reader<'static>, scan: &mut Scan, secs: u32) {
     println!("reader: scanning for {secs}s — present a tag");
-    let mut last_card = None;
-    let mut tracker = CardTracker::default();
     for _ in 0..secs {
-        if cards {
-            // Report card UIDs so they can be copied into tags.toml, debounced the same
-            // way the control loop does it — an unfiltered log would show flapping that
-            // the running system never sees.
-            let card = tracker.update(poll_card(reader).unwrap_or(None));
-            if card != last_card {
-                match card {
-                    Some(c) => println!("reader: card {}", card_hex(&c)),
-                    None => println!("reader: card gone"),
-                }
-                last_card = card;
-            }
-        } else {
-            scan.poll(reader);
-        }
+        scan.poll(reader);
         embassy_time::Timer::after(embassy_time::Duration::from_secs(1)).await;
     }
     println!("reader: scan window over");
@@ -392,7 +364,7 @@ pub async fn bringup_scan(
 /// has had was a logic bug, and twice they were the same one — a reader failure being
 /// passed along as "nothing is in the field", which starts the clock on a device that
 /// never moved.
-pub type Docking = medienzeit_core::docking::Docking<Uid, CardUid, 2>;
+pub type Docking = medienzeit_core::docking::Docking<Uid, 2>;
 
 /// Format a UID for a message, most significant byte first.
 pub fn uid_hex(uid: &Uid) -> heapless::String<16> {
@@ -401,95 +373,6 @@ pub fn uid_hex(uid: &Uid) -> heapless::String<16> {
         let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
     }
     s
-}
-
-/// Poll for a single ISO 14443A card. The front end must already be on that protocol.
-///
-/// Interim support while the ISO 15693 stickers are in the post: shorter range, and one
-/// card at a time, since there is no anticollision here. Two cards in the field collide
-/// and read as nothing, which is the safe way to fail — no identity rather than a wrong
-/// one.
-/// `None` means the reader failed; `Some(None)` means it worked and no card is there.
-///
-/// The distinction is the whole safety property. Collapsing the two lets a broken reader
-/// masquerade as "the card has been taken", which starts the clock and eventually cuts
-/// the internet on a device that never moved.
-pub fn poll_card(reader: &mut Reader<'static>) -> Option<Option<CardUid>> {
-    match reader.iso14443a_uid() {
-        Ok(u) => Some(u),
-        Err(e) => {
-            println!("reader: card poll failed ({e:?})");
-            None
-        }
-    }
-}
-
-/// Format a card UID for a message, most significant byte first.
-pub fn card_hex(uid: &CardUid) -> heapless::String<8> {
-    let mut s = heapless::String::new();
-    for b in uid.0 {
-        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
-    }
-    s
-}
-
-/// Debounces card reads.
-///
-/// Two failure modes seen on the bench, both of which would reach the ledger unfiltered:
-/// a card at the edge of the field drops out for single polls, which would toggle
-/// `docked` every second and flip the ledger between filling and draining; and a garbled
-/// frame occasionally passes the BCC, since that checksum is only eight bits and roughly
-/// one corrupt frame in 256 survives it. So a new identity has to appear twice in a row
-/// to be believed, and an absence has to persist before it counts.
-#[derive(Default)]
-pub struct CardTracker {
-    current: Option<CardUid>,
-    candidate: Option<CardUid>,
-    candidate_hits: u32,
-    misses: u32,
-}
-
-/// Consecutive identical reads before a *new* card is accepted.
-const CARD_CONFIRM: u32 = 2;
-/// Consecutive empty polls before a card counts as gone.
-///
-/// Six rather than three: a card is re-powered from cold on every poll, so short dropouts
-/// are normal even when it has not moved. The cost of being generous is that a real
-/// pickup takes a few seconds to register, which is nothing against a budget measured in
-/// hours — where a false "taken" is visible immediately as the internet being cut.
-const CARD_MISS_LIMIT: u32 = 6;
-
-impl CardTracker {
-    pub fn update(&mut self, raw: Option<CardUid>) -> Option<CardUid> {
-        match raw {
-            Some(u) => {
-                self.misses = 0;
-                if self.current == Some(u) {
-                    self.candidate = None;
-                    self.candidate_hits = 0;
-                } else if self.candidate == Some(u) {
-                    self.candidate_hits += 1;
-                    if self.candidate_hits >= CARD_CONFIRM {
-                        self.current = Some(u);
-                        self.candidate = None;
-                        self.candidate_hits = 0;
-                    }
-                } else {
-                    self.candidate = Some(u);
-                    self.candidate_hits = 1;
-                }
-            }
-            None => {
-                self.candidate = None;
-                self.candidate_hits = 0;
-                self.misses += 1;
-                if self.misses >= CARD_MISS_LIMIT {
-                    self.current = None;
-                }
-            }
-        }
-        self.current
-    }
 }
 
 /// Run both inventory methods side by side and report what each sees.
@@ -566,14 +449,8 @@ pub fn docked() -> [bool; 2] {
 /// Alerts are emitted here rather than published, because they are edge-triggered. A
 /// cell the control loop polls would re-fire them every tick.
 #[embassy_executor::task]
-pub async fn task(
-    mut nfc: Reader<'static>,
-    mut docking: Docking,
-    cards: bool,
-    boot: Input<'static>,
-) {
+pub async fn task(mut nfc: Reader<'static>, mut docking: Docking, boot: Input<'static>) {
     let mut scan = Scan::default();
-    let mut card_tracker = CardTracker::default();
     let mut last = docked();
     let mut last_recoveries = 0;
     let mut ticker = embassy_time::Ticker::every(embassy_time::Duration::from_secs(1));
@@ -581,18 +458,10 @@ pub async fn task(
     loop {
         ticker.next().await;
 
-        // One protocol per build; see tags.toml. A reader failure has to reach Docking
-        // as a failure in either protocol — `Some(&[])` would say "the reader is fine
-        // and nothing is there", which is what makes a broken reader start the clock.
-        let (seen, card) = if cards {
-            match poll_card(&mut nfc) {
-                Some(raw) => (Some(&[][..]), card_tracker.update(raw)),
-                None => (None, None),
-            }
-        } else {
-            (scan.poll(&mut nfc), None)
-        };
-        let d = docking.update(seen, card, [boot.is_high(), true]);
+        // `scan.poll` returns None when the reader failed, and Docking must see that as
+        // a failure: `Some(&[])` would say "the reader is fine and nothing is there",
+        // which is what makes a broken reader start the clock.
+        let d = docking.update(scan.poll(&mut nfc), [boot.is_high(), true]);
         DOCKED.lock(|c| *c.borrow_mut() = d.docked);
 
         // Reads can keep succeeding while the front end is quietly having to be cycled,
