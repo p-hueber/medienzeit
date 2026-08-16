@@ -121,12 +121,16 @@ impl rand_core::CryptoRng for HwRng {}
 
 #[embassy_executor::task]
 pub async fn sender(stack: Stack<'static>, cfg: Config) {
+    // The topic is not logged. ntfy treats it as a bearer token for *both* publishing
+    // and subscribing, so anyone who reads it can post alerts to this household or read
+    // them. Serial logs get pasted into issues; this repository is public. A short
+    // prefix is enough to tell two configurations apart without giving it away.
     println!(
-        "notify: sender up, posting to {}{}:{}/{} ",
+        "notify: sender up, posting to {}{}:{}/{}… ",
         if cfg.tls { "https://" } else { "http://" },
         cfg.host_header,
         cfg.port,
-        cfg.topic
+        &cfg.topic[..cfg.topic.len().min(4)]
     );
 
     let tls_rx = TLS_RX.init([0; 16384]);

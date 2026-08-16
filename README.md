@@ -27,10 +27,34 @@ Full design, hardware BOM and milestones: `~/.claude/plans/so-i-have-issues-melo
 `pn5180/` (ISO 15693 reader driver, written from scratch) and `firmware/` (ESP32-S3,
 embassy) land in M2 and M3.
 
+## Configuration, and what must never be committed
+
+**This repository is public.** Everything device-specific lives in files under
+`firmware/` that are gitignored and have never been tracked:
+
+| File | Holds |
+|---|---|
+| `wifi.toml` | SSID and PSK |
+| `fritzbox.toml` | TR-064 user and password, device names and MACs |
+| `web.toml` | admin page credentials |
+| `ntfy.toml` | push endpoint and **topic** |
+| `tags.toml` | the NFC sticker UIDs |
+
+`build.rs` reads them at compile time and prints a template if one is missing, so a
+fresh clone tells you what it wants rather than failing obscurely.
+
+**The ntfy topic is a credential**, even though it does not look like one: ntfy uses it
+as a bearer token for publishing *and* subscribing, so anyone holding it can post alerts
+into this household or read them. It is deliberately not logged — the firmware prints
+only a four-character prefix — because serial output is the thing most likely to end up
+pasted into an issue.
+
+If you add a new configuration file, add it to `firmware/.gitignore` in the same commit.
+
 ## Running
 
 ```sh
-cargo test                       # 65 tests, all host-side
+cargo test                       # 128 tests, all host-side
 cargo run -p medienzeit-sim      # interactive virtual display (needs SDL2)
 cargo run -p medienzeit-sim -- --shots shots/   # one PNG per screen state
 ```

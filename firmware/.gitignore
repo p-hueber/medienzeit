@@ -1,3 +1,6 @@
+# Device-specific configuration, read by build.rs. Never commit these: the
+# repository is public, and the ntfy topic is a bearer token despite not
+# looking like one. Add any new config file here in the same commit.
 /target
 wifi.toml
 fritzbox.toml
