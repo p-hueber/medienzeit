@@ -57,10 +57,10 @@ const OUTAGE_MIN_SECS: i64 = 5 * 60;
 /// point at which ghosting becomes noticeable on this panel.
 const QUICK_REFRESHES_PER_FULL: u32 = 30;
 
-/// Socket budget. DHCP, DNS, the admin server's listener, one transient TR-064
+/// Socket budget. DHCP, DNS, three admin-server acceptors, one transient TR-064
 /// connection and one transient alert connection — with headroom, because running out
 /// does not fail loudly, it just makes `connect` hang forever.
-static RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
+static RESOURCES: StaticCell<StackResources<12>> = StaticCell::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
@@ -205,7 +205,9 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(net::connection(controller).unwrap());
     spawner.spawn(net::net_task(runner).unwrap());
-    spawner.spawn(web::serve(stack).unwrap());
+    for slot in 0..web::ACCEPTORS {
+        spawner.spawn(web::serve(stack, slot).unwrap());
+    }
     spawner.spawn(
         notify::sender(
             stack,

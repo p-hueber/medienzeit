@@ -105,13 +105,28 @@ fn base64_into(input: &[u8], out: &mut String<128>) {
     }
 }
 
-#[embassy_executor::task]
-pub async fn serve(stack: Stack<'static>) {
+/// How many connections can be in flight at once.
+///
+/// One is not enough, and the failure is not subtle: with a single acceptor there is no
+/// listen backlog, so any connection arriving while a request is being served — or in
+/// the gap between closing one socket and accepting the next — is refused outright with
+/// an RST. A browser opens at least two (the page and the stylesheet), and a form
+/// submission adds another, so a plain page load lost a connection routinely. Measured:
+/// four concurrent requests, one served, three refused instantly.
+pub const ACCEPTORS: usize = 3;
+
+#[embassy_executor::task(pool_size = ACCEPTORS)]
+pub async fn serve(stack: Stack<'static>, slot: usize) {
     let mut auth: String<128> = String::new();
     expected_auth(&mut auth);
-    println!("web: serving on port 80");
-    let out = OUT.init(String::new());
-    let body = BODY.init(String::new());
+    if slot == 0 {
+        println!("web: serving on port 80, {ACCEPTORS} acceptors");
+    }
+    // Per-acceptor buffers. Sharing one pair would be a data race across the await in
+    // `write_all`: the response is borrowed from the buffer, and another acceptor
+    // running while that write is suspended would overwrite it mid-send.
+    let out = OUTS[slot].init(String::new());
+    let body = BODIES[slot].init(String::new());
 
     loop {
         let mut rx = [0u8; 1024];
@@ -182,8 +197,8 @@ const STYLESHEET: &str = include_str!("s.css");
 /// Statics rather than locals: the settings form pushed these past 4 KB together, which
 /// is more than the web task's stack wants to carry. Only one request is handled at a
 /// time, so a single pair is enough.
-static OUT: StaticCell<String<8192>> = StaticCell::new();
-static BODY: StaticCell<String<6144>> = StaticCell::new();
+static OUTS: [StaticCell<String<8192>>; ACCEPTORS] = [const { StaticCell::new() }; ACCEPTORS];
+static BODIES: [StaticCell<String<6144>>; ACCEPTORS] = [const { StaticCell::new() }; ACCEPTORS];
 
 /// Warn before the page silently loses its tail.
 ///
@@ -470,10 +485,12 @@ fn page(
         out,
         "<form method=post action=/>\
          <p class=earn-row>\
-         <label class=visually-hidden for=rn>Verdient, Minuten</label>\
+         <label class=visually-hidden for=rn>Gutschrift in Minuten</label>\
          Verdient <input type=number id=rn name=rn value={} min=0 inputmode=numeric> Min je \
-         <label class=visually-hidden for=rd>je Minuten weggenommen</label>\
-         <input type=number id=rd name=rd value={} min=1 inputmode=numeric> Min weggenommen</p>\
+         <label class=visually-hidden for=rd>je Minuten ohne Nutzung</label>\
+         <input type=number id=rd name=rd value={} min=1 inputmode=numeric> Min ohne Nutzung</p>\
+         <p class=explainer>Ohne Nutzung heißt: zurückgelegt am Leser oder unterwegs. \
+         Beides zählt gleich — außer Haus zu sein kostet nie etwas.</p>\
          <div class=rule-row><label for=cap>Höchststand</label>\
          <span><input type=number id=cap name=cap value={} min=0 inputmode=numeric>\
          <span class=unit-hint>Min</span></span></div>\
