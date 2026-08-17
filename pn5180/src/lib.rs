@@ -214,13 +214,23 @@ pub struct TagSet<const N: usize> {
     missing: [u32; N],
     len: usize,
     limit: u32,
+    /// Last round's raw reading, for confirming newcomers.
+    prev: [Uid; N],
+    prev_len: usize,
 }
 
 impl<const N: usize> TagSet<N> {
     /// `limit` is how many consecutive rounds a tag may be missing before it counts as
     /// gone. Zero means believe every round exactly as it comes.
     pub fn new(limit: u32) -> Self {
-        Self { tags: [Uid::default(); N], missing: [0; N], len: 0, limit }
+        Self {
+            tags: [Uid::default(); N],
+            missing: [0; N],
+            len: 0,
+            limit,
+            prev: [Uid::default(); N],
+            prev_len: 0,
+        }
     }
 
     pub fn tags(&self) -> &[Uid] {
@@ -232,6 +242,19 @@ impl<const N: usize> TagSet<N> {
     }
 
     /// Fold one round's reading in, and return the believed set.
+    ///
+    /// # Why a newcomer needs two rounds
+    ///
+    /// The ISO 15693 frame is CRC-protected and the reader checks it in hardware, but
+    /// the SPI link carrying the answer to the host is not protected at all. On dupont
+    /// wiring that link flips bits: measured in service, about two dozen times a day,
+    /// each one a single-bit corruption of a real tag's UID scattered across every byte.
+    ///
+    /// Each corruption is a fresh random value, so requiring the *same* new UID in two
+    /// consecutive rounds rejects essentially all of them — a flip would have to repeat
+    /// itself exactly. The cost is one extra second before a genuinely new tag is
+    /// believed, against alerts for tags that do not exist and, worse, the chance of a
+    /// corrupted read matching another device's UID.
     pub fn update(&mut self, seen: &[Uid]) -> &[Uid] {
         // Age existing entries, dropping those missing for too long. Iterating downwards
         // keeps the swap-remove from skipping an entry.
@@ -249,15 +272,18 @@ impl<const N: usize> TagSet<N> {
                 }
             }
         }
-        // Newly seen tags are believed at once: a device being picked up should register
-        // immediately, where a device going quiet deserves the benefit of the doubt.
+        // A tag not already believed joins only if the previous round saw it too.
         for uid in seen {
-            if !self.tags[..self.len].contains(uid) && self.len < N {
+            let known = self.tags[..self.len].contains(uid);
+            let confirmed = self.prev[..self.prev_len].contains(uid);
+            if !known && confirmed && self.len < N {
                 self.tags[self.len] = *uid;
                 self.missing[self.len] = 0;
                 self.len += 1;
             }
         }
+        self.prev_len = seen.len().min(N);
+        self.prev[..self.prev_len].copy_from_slice(&seen[..self.prev_len]);
         self.tags()
     }
 }
@@ -803,15 +829,40 @@ mod tests {
         Uid([n, 0, 0, 0, 0, 0, 0x04, 0xe0])
     }
 
+    /// A newcomer takes two consecutive rounds, because a single sighting is exactly
+    /// what a corrupted read looks like.
     #[test]
-    fn a_new_tag_is_believed_immediately() {
+    fn a_new_tag_needs_confirming() {
         let mut set: TagSet<4> = TagSet::new(3);
-        assert_eq!(set.update(&[uid(1)]), &[uid(1)]);
+        assert!(set.update(&[uid(1)]).is_empty(), "not on the first sighting");
+        assert_eq!(set.update(&[uid(1)]), &[uid(1)], "believed on the second");
+    }
+
+    /// The failure this exists for: SPI corruption produces a fresh wrong UID each
+    /// time, so no single one ever repeats and none should be believed.
+    #[test]
+    fn one_off_corruptions_are_never_believed() {
+        let mut set: TagSet<4> = TagSet::new(3);
+        for n in 100..120 {
+            set.update(&[uid(n)]);
+        }
+        assert!(set.tags().is_empty(), "a stream of distinct one-offs believes nothing");
+    }
+
+    /// A corrupt read alongside the real tag must not displace it, and must not join.
+    #[test]
+    fn a_corrupt_read_beside_a_real_one_changes_nothing() {
+        let mut set: TagSet<4> = TagSet::new(3);
+        set.update(&[uid(1)]);
+        set.update(&[uid(1)]);
+        let after = set.update(&[uid(1), uid(200)]);
+        assert_eq!(after, &[uid(1)]);
     }
 
     #[test]
     fn a_single_dropped_round_is_tolerated() {
         let mut set: TagSet<4> = TagSet::new(3);
+        set.update(&[uid(1)]);
         set.update(&[uid(1)]);
         assert_eq!(set.update(&[]), &[uid(1)], "one miss must not remove it");
         assert_eq!(set.update(&[uid(1)]), &[uid(1)]);
@@ -820,6 +871,7 @@ mod tests {
     #[test]
     fn a_tag_goes_once_it_stays_missing() {
         let mut set: TagSet<4> = TagSet::new(3);
+        set.update(&[uid(1)]);
         set.update(&[uid(1)]);
         for _ in 0..3 {
             assert_eq!(set.update(&[]).len(), 1);
@@ -834,6 +886,7 @@ mod tests {
     fn a_round_that_sees_the_other_tag_does_not_swap_them() {
         let mut set: TagSet<4> = TagSet::new(3);
         set.update(&[uid(1), uid(2)]);
+        set.update(&[uid(1), uid(2)]);
         let after = set.update(&[uid(2)]);
         assert!(after.contains(&uid(1)), "the missed tag must survive one round");
         assert!(after.contains(&uid(2)));
@@ -844,6 +897,7 @@ mod tests {
     fn a_real_removal_still_registers_with_the_other_present() {
         let mut set: TagSet<4> = TagSet::new(3);
         set.update(&[uid(1), uid(2)]);
+        set.update(&[uid(1), uid(2)]);
         for _ in 0..4 {
             set.update(&[uid(2)]);
         }
@@ -853,6 +907,7 @@ mod tests {
     #[test]
     fn removing_the_first_of_several_keeps_the_rest() {
         let mut set: TagSet<4> = TagSet::new(0);
+        set.update(&[uid(1), uid(2), uid(3)]);
         set.update(&[uid(1), uid(2), uid(3)]);
         assert_eq!(set.update(&[uid(2), uid(3)]).len(), 2);
         assert!(set.contains(&uid(2)) && set.contains(&uid(3)));

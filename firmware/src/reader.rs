@@ -81,10 +81,14 @@ pub fn new(spi: esp_hal::peripherals::SPI3<'static>, pins: Pins) -> Reader<'stat
 
     let bus = Spi::new(
         spi,
-        // The PN5180 tops out around 7 MHz; 2 MHz is plenty for inventory and is kind
-        // to dupont wiring, which is what this is running on during bring-up.
+        // The PN5180 tops out around 7 MHz. 1 MHz because the SPI link is the weak
+        // point here: the RF frame is CRC-protected and checked in hardware, but this
+        // link is not protected at all, and on dupont wiring it was flipping bits about
+        // two dozen times a day — each one a single-bit corruption of a real UID. There
+        // is no shortage of time budget; a 16-slot round is dominated by waiting for
+        // tags, not by clocking bytes.
         SpiConfig::default()
-            .with_frequency(Rate::from_mhz(2))
+            .with_frequency(Rate::from_mhz(1))
             .with_mode(Mode::_0),
     )
     .expect("spi3 config")
