@@ -458,6 +458,9 @@ pub async fn task(mut nfc: Reader<'static>, mut docking: Docking, boot: Input<'s
     let mut last = docked();
     let mut last_recoveries = 0;
     let mut ticker = embassy_time::Ticker::every(embassy_time::Duration::from_secs(1));
+    // A round is the executor stall this task costs everything else, so it is the number
+    // the two-core split is judged against. Once a minute is often enough to watch.
+    let mut round = crate::timing::Stats::new("reader round", 60);
 
     loop {
         ticker.next().await;
@@ -465,7 +468,8 @@ pub async fn task(mut nfc: Reader<'static>, mut docking: Docking, boot: Input<'s
         // `scan.poll` returns None when the reader failed, and Docking must see that as
         // a failure: `Some(&[])` would say "the reader is fine and nothing is there",
         // which is what makes a broken reader start the clock.
-        let d = docking.update(scan.poll(&mut nfc), [boot.is_high(), true]);
+        let seen = round.time(|| scan.poll(&mut nfc));
+        let d = docking.update(seen, [boot.is_high(), true]);
         DOCKED.lock(|c| *c.borrow_mut() = d.docked);
 
         // Reads can keep succeeding while the front end is quietly having to be cycled,

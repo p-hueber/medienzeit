@@ -9,6 +9,7 @@ mod panel;
 mod reader;
 mod rtc;
 mod storage;
+mod timing;
 mod web;
 
 // Pulls in the panic handler and the backtrace printer; not referenced directly.
@@ -71,6 +72,8 @@ async fn main(spawner: Spawner) {
     let sw = SoftwareInterruptControl::new(p.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw.software_interrupt0);
     println!("medienzeit: booted");
+
+    start_second_core_spike(p.CPU_CTRL, sw.software_interrupt1);
 
     let mut panel = panel::Panel::new(
         p.SPI2,
@@ -505,11 +508,19 @@ impl Screen {
         fp: Fingerprint,
         mode: panel::Refresh,
     ) {
-        println!(
-            "screen: {:?} redraw at {:02}:{:02}, balance {}s",
-            mode, snapshot.local.hour, snapshot.local.minute, snapshot.balance_secs
-        );
+        // Timed because this is the longest blocking call in the firmware and its cost
+        // was, until measured, a datasheet typical. Logged per call: at roughly one a
+        // minute it is not noise, and the full/quick difference is the whole point.
+        let started = Instant::now();
         show(panel, snapshot, mode);
+        println!(
+            "screen: {:?} redraw at {:02}:{:02}, balance {}s, took {}",
+            mode,
+            snapshot.local.hour,
+            snapshot.local.minute,
+            snapshot.balance_secs,
+            timing::Ms(started.elapsed().as_micros())
+        );
         self.last = Some(fp);
         self.quick_since_full = match mode {
             panel::Refresh::Full => 0,
@@ -567,4 +578,41 @@ async fn park() -> ! {
     loop {
         Timer::after(Duration::from_secs(30)).await;
     }
+}
+
+/// Step 0 of the two-core split: prove the second core is survivable before refactoring
+/// for it. See `docs/two-core-split.md`.
+///
+/// Starting core 1 makes the esp-rtos scheduler SMP, under a Wi-Fi stack that has only
+/// ever run single-core here. That is the one risk that would invalidate the whole
+/// design, so it is tested alone, with a core that does nothing but prove it is alive.
+///
+/// It is started *before* Wi-Fi deliberately: initialising the radio while the second
+/// core runs is the harshest ordering, and the point is to fail now rather than after
+/// the refactor.
+///
+/// The heartbeat is what makes flash parking visible. Every journal write parks this
+/// core (`storage::Journal::open` asks for `multicore_auto_park`), so a beat that stops
+/// or a system that wedges around a write is the failure this spike is looking for.
+fn start_second_core_spike(
+    cpu_ctrl: esp_hal::peripherals::CPU_CTRL<'static>,
+    int1: esp_hal::interrupt::software::SoftwareInterrupt<'static, 1>,
+) {
+    /// Sized for the eventual `room` loop, whose stack has to hold the 5 KB framebuffer
+    /// that `show` builds as a local. Oversized for a heartbeat, but this is the number
+    /// the real split needs, so it is the number worth proving.
+    // Spelled out rather than imported: `embassy_net::Stack` is already in scope here
+    // and means something entirely different.
+    static STACK: StaticCell<esp_hal::system::Stack<16384>> = StaticCell::new();
+
+    esp_rtos::start_second_core(cpu_ctrl, int1, STACK.init(esp_hal::system::Stack::new()), || {
+        println!("core1: running");
+        let mut beats = 0u32;
+        loop {
+            esp_rtos::CurrentThreadHandle::get()
+                .delay(esp_hal::time::Duration::from_secs(5));
+            beats += 1;
+            println!("core1: alive, {beats} beats");
+        }
+    });
 }
