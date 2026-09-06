@@ -92,6 +92,16 @@ pub enum Refresh {
     Quick,
 }
 
+/// The host-tested decision maps onto this crate's waveform names.
+impl From<medienzeit_core::screen::Refresh> for Refresh {
+    fn from(r: medienzeit_core::screen::Refresh) -> Self {
+        match r {
+            medienzeit_core::screen::Refresh::Full => Refresh::Full,
+            medienzeit_core::screen::Refresh::Quick => Refresh::Quick,
+        }
+    }
+}
+
 impl From<Refresh> for RefreshLut {
     fn from(r: Refresh) -> Self {
         match r {

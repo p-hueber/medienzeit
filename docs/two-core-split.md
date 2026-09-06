@@ -282,11 +282,17 @@ Two things the flip needed that the plan had not anticipated:
   rather than tolerated.
 - **The reader task's own doc comment** (`reader.rs:449`) currently explains that the
   task is organisational and does not make polling concurrent. After this it does.
-- **`Screen` becomes testable.** Once the loop is straight-line synchronous, its body
-  extracts as a pure step function, host-testable the way `Docking` now is. The refresh
-  decision — quick vs full, and the lockout-inversion case at `main.rs:449` — is exactly
-  the kind of logic this project has been bitten by and currently has no test for. Not
-  part of this refactor; cheap afterwards.
+- **`Screen` is now testable, and tested.** The refresh decision moved to
+  `core/src/screen.rs` with 11 tests: the lockout inversion in both directions, the
+  night boundary, the ghosting schedule and its reset, and the minute bucketing. The
+  firmware keeps only the part that cannot be host-tested — pushing pixels — and calls
+  `drawn` after the refresh rather than before, so a refresh that did not happen is not
+  recorded as having.
+
+  Writing the tests immediately caught a wrong assumption of mine about the bucketing:
+  `600/60` is 10 but `599/60` is 9, so a single second there *is* a visible change. The
+  production code was right and the new test was wrong, which is the cheap direction for
+  that mistake to run.
 - **Web latency** is not directly addressed. `web`, `net` and `notify` still share core
   0's executor — but all three are genuinely async, so cooperative scheduling is right
   there. If the admin page is still slow afterwards, the cause is elsewhere (socket

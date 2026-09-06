@@ -8,6 +8,7 @@
 
 pub mod civil;
 pub mod docking;
+pub mod screen;
 pub mod journal;
 pub mod policy;
 pub mod rtc;

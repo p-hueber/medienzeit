@@ -13,18 +13,13 @@
 use embassy_time::Instant;
 use esp_println::println;
 
+use medienzeit_core::screen::{Fingerprint, Screen};
 use medienzeit_core::{Event, Ledger, Policy, Snapshot};
 
 use crate::{chime, panel, reader, rtc, shared, DEV_NAMES};
 
 /// How often to journal the balance. A power cut costs at most this much.
 const JOURNAL_PERIOD: u64 = 30;
-
-/// Quick refreshes before forcing a full one to clear accumulated ghosting.
-///
-/// At one update per minute that is a flash every half hour, which is roughly the
-/// point at which ghosting becomes noticeable on this panel.
-const QUICK_REFRESHES_PER_FULL: u32 = 30;
 
 pub struct Room {
     panel: panel::Panel<'static>,
@@ -98,7 +93,7 @@ impl Room {
         };
         self.last_tick = Some(t);
         let (snapshot, _) = self.ledger.tick(t, [true; 2], [false; 2], &self.policy);
-        self.screen.draw(&mut self.panel, &mut self.fbuf, &snapshot);
+        self.redraw(&snapshot);
         shared::publish_snapshot(snapshot);
     }
 
@@ -138,7 +133,7 @@ impl Room {
             }
         }
 
-        self.screen.draw(&mut self.panel, &mut self.fbuf, &snapshot);
+        self.redraw(&snapshot);
         shared::publish_snapshot(snapshot.clone());
         self.maybe_persist(&snapshot, t);
     }
@@ -168,6 +163,31 @@ impl Room {
             let now = Instant::now();
             next = if next > now { next + PERIOD } else { now + PERIOD };
         }
+    }
+
+    /// Redraw the panel if what it shows has changed.
+    ///
+    /// The decision is `medienzeit_core::screen`, host-tested; this is only the part
+    /// that cannot be — pushing pixels at a panel. `drawn` is called after the refresh
+    /// and not before, so a refresh that failed to happen is not recorded as having.
+    fn redraw(&mut self, snapshot: &Snapshot<2>) {
+        let fp = Fingerprint::of(snapshot);
+        let Some(mode) = self.screen.decide(fp) else {
+            return;
+        };
+        // Timed because this is the longest blocking call in the firmware, and its cost
+        // was a datasheet typical until it was measured.
+        let started = Instant::now();
+        show(&mut self.panel, &mut self.fbuf, snapshot, mode.into());
+        println!(
+            "screen: {:?} redraw at {:02}:{:02}, balance {}s, took {}",
+            mode,
+            snapshot.local.hour,
+            snapshot.local.minute,
+            snapshot.balance_secs,
+            crate::timing::Ms(started.elapsed().as_micros())
+        );
+        self.screen.drawn(fp, mode);
     }
 
     /// Apply a validated wall clock to the RTC, if the network has produced one.
@@ -261,88 +281,6 @@ impl Room {
             self.last_persisted_flow = Some(snapshot.flow);
             shared::PERSIST.signal((snapshot.balance_secs, t));
         }
-    }
-}
-
-/// Everything the screen actually shows. Redrawing on anything else wastes a refresh.
-type Fingerprint = (i32, u32, u32, bool, medienzeit_core::Flow, [bool; 2]);
-
-fn fingerprint(s: &Snapshot<2>) -> Fingerprint {
-    (
-        s.balance_secs / 60,
-        s.local.hour,
-        s.local.minute,
-        s.night,
-        s.flow,
-        s.docked,
-    )
-}
-
-/// Decides *whether* to redraw and *how*.
-///
-/// E-paper updates are slow and the panel has a finite number of them, so the screen is
-/// only touched when something visible changed. Most of those changes are one digit of a
-/// countdown, which the quick waveform handles without flashing the whole panel.
-#[derive(Default)]
-struct Screen {
-    last: Option<Fingerprint>,
-    quick_since_full: u32,
-}
-
-impl Screen {
-    fn draw(
-        &mut self,
-        panel: &mut panel::Panel<'static>,
-        fbuf: &mut panel::Framebuffer,
-        snapshot: &Snapshot<2>,
-    ) {
-        let now = fingerprint(snapshot);
-        let Some(previous) = self.last else {
-            // First frame of the session: nothing is on the panel we can trust.
-            self.present(panel, fbuf, snapshot, now, panel::Refresh::Full);
-            return;
-        };
-        if previous == now {
-            return;
-        }
-
-        // A lockout is the one transition that inverts the entire screen. Doing that
-        // with the quick waveform leaves the old image ghosted through the new one,
-        // which is exactly when legibility matters most.
-        let lockout_changed = previous.3 != now.3 || (previous.0 <= 0) != (now.0 <= 0);
-        let mode = if lockout_changed || self.quick_since_full >= QUICK_REFRESHES_PER_FULL {
-            panel::Refresh::Full
-        } else {
-            panel::Refresh::Quick
-        };
-        self.present(panel, fbuf, snapshot, now, mode);
-    }
-
-    fn present(
-        &mut self,
-        panel: &mut panel::Panel<'static>,
-        fbuf: &mut panel::Framebuffer,
-        snapshot: &Snapshot<2>,
-        fp: Fingerprint,
-        mode: panel::Refresh,
-    ) {
-        // Timed because this is the longest blocking call in the firmware and its cost
-        // was, until measured, a datasheet typical.
-        let started = Instant::now();
-        show(panel, fbuf, snapshot, mode);
-        println!(
-            "screen: {:?} redraw at {:02}:{:02}, balance {}s, took {}",
-            mode,
-            snapshot.local.hour,
-            snapshot.local.minute,
-            snapshot.balance_secs,
-            crate::timing::Ms(started.elapsed().as_micros())
-        );
-        self.last = Some(fp);
-        self.quick_since_full = match mode {
-            panel::Refresh::Full => 0,
-            panel::Refresh::Quick => self.quick_since_full + 1,
-        };
     }
 }
 
