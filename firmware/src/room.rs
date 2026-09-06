@@ -102,6 +102,12 @@ impl Room {
         self.take_clock_correction();
         self.take_policy_change();
 
+        // Polled before the clock is consulted, and unconditionally. Accounting cannot
+        // run without a trustworthy clock, but the reader still has to: a tag on the
+        // wrong device is worth an alert whether or not the ledger is ticking, and this
+        // used to be a separate task that did not care about the time at all.
+        let docked = self.poll_reader();
+
         // The RTC is authoritative between SNTP syncs, so a missed tick or a slow
         // network call cannot make the ledger lose time.
         let Some(previous) = self.last_tick else {
@@ -115,8 +121,6 @@ impl Room {
             self.ledger.grant_bonus(secs, &self.policy);
             println!("room: +{secs}s granted");
         }
-
-        let docked = self.poll_reader();
         let (snapshot, events) =
             self.ledger
                 .tick(t, docked, shared::presence(), &self.policy);
