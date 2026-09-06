@@ -12,7 +12,7 @@ than the guesses this plan originally carried (~2 s / "a few hundred ms" for the
 | Where | Cost per call | How often |
 |---|---|---|
 | `panel.present()` — `panel.rs:166`, via `Screen::draw` at `main.rs:452` | **full 1812 ms, quick ~1050 ms** | quick ~1/min, full every 30 quicks or on lockout |
-| `reader::task` 16-slot inventory — `reader.rs:456` | **avg 610–620 ms, max 1208 ms** | 1 Hz, so **~62% duty** |
+| `reader::task` 16-slot inventory — `reader.rs:456` | **avg 190 ms** (was 620 before the `await_frame` fix below) | 1 Hz, so ~19% duty |
 | `chime.warning()` — `chime.rs:200` | up to 1 s, capped by the assert at `chime.rs:53` | one event, and currently silent |
 | `journal.append()` / `settings_store.save()` — `main.rs:357`, `:308` | <1 ms for a 20-byte record; tens of ms for a 4 KB sector erase | record every 30 s; erase ~hourly (`storage.rs:8`) |
 | `rtc::now(&mut i2c)` — `main.rs:303` | ~1 ms | 1 Hz |
@@ -154,20 +154,18 @@ elapsed time correctly rather than losing a second.
 
 | Case | Cost | Frequency |
 |---|---|---|
-| idle | ~620 ms reader + ~1 ms RTC | most seconds |
-| quick refresh | ~1.7 s — **misses the deadline** | ~1/min |
-| full refresh | ~2.4 s — **misses the deadline** | every ~30 min |
+| idle | ~190 ms reader + ~1 ms RTC | most seconds |
+| quick refresh | ~1.25 s — **misses the deadline** | ~1/min |
+| full refresh | ~2.0 s — **misses the deadline** | every ~30 min |
 | chime | +1 s | per Warning event |
 
-**Every redraw overruns, not just the full ones.** An earlier draft of this plan claimed
-only the full refresh missed the deadline; that was based on estimates that measurement
-disproved. Worst-case reader detection latency is therefore ~2.4 s, against a 180 s grace
-window — still immaterial, and accounting is unaffected because `tick` is driven by the
-RTC timestamp rather than by iteration count.
+**Every redraw overruns, not just the full ones.** An earlier draft claimed only the full
+refresh missed the deadline; measurement disproved it. Worst-case reader detection
+latency is ~2 s against a 180 s grace window — immaterial — and accounting is unaffected
+because `tick` is driven by the RTC timestamp rather than by iteration count.
 
-The honest summary is that core 1 will be busy roughly two thirds of the time and will
-skip a beat once a minute. That is fine for what it does, and it is precisely why none of
-it belongs on the core running the network stack.
+With the reader fixed, **the panel is now the whole problem**: about a second of blocking
+every minute, against the reader's 190 ms. That is the case for the split in one line.
 
 **Not attempted: concurrency within core 1.** esp-rtos 0.3 exposes no thread-spawn API,
 so the only mechanism is an interrupt executor — and putting a 200 ms blocking SPI round
@@ -220,11 +218,34 @@ Flashed with core 1 started *before* Wi-Fi, running nothing but a 5 s heartbeat.
 - **The heartbeat never missed**, including across journal writes.
 - Balance survived the reflash: `journal: recovered balance 7956s from slot 575`.
 
-Open question the numbers raise: **620 ms for a 16-slot inventory is suspicious.** The
-SPI traffic is tiny even at 1 MHz, so the time is almost certainly fixed delays or
-timeouts in the driver — roughly 38 ms per slot. It is the single largest CPU consumer in
-the firmware and may be cheap to cut. Worth investigating on its own, independently of
-this refactor.
+### The 620 ms reader round was a bug, and is now 190 ms
+
+Chased before starting step 1, on the theory that the SPI traffic could not explain it.
+It could not: at 1 MHz a whole round is under a millisecond of actual bytes.
+
+`await_frame` polled `IRQ_STATUS` and then slept 100 us between polls. But a poll is a
+register read over SPI, measured at **263 us** — 48 us of SPI and the rest BUSY
+handshake. So each step cost 363 us, not the 100 us the loop was written around, and the
+"10 ms" per-slot timeout was really 36 ms. Sixteen empty slots × 36 ms = 580 ms of the
+608 ms round. The entire round was that one loop.
+
+The fix is to stop sleeping — the transaction already paces the loop — and to derive the
+step count from what a poll actually costs (`POLL_COST_US`). The timeout now means what
+it says, and the round is **190 ms**: 16 slots × the 10 ms of genuine RF wait that was
+always intended.
+
+Two things worth keeping in view:
+
+- **`POLL_COST_US` is a measured constant governing every RF timeout, and nothing else
+  would notice it going stale.** Halving the SPI clock — which is exactly what the
+  bit-flip mitigation did — would double it and silently stretch every timeout. So
+  `reader::bench` runs at boot and complains if a real read drifts more than 25% from
+  the constant.
+- **Further speedup is now an RF reliability trade, not an overhead question.** The
+  remaining 190 ms is the tag reply window. A tag answers in ~4 ms at 26 kbit/s, so 10 ms
+  is deliberate slack for one at the edge of the field — and with range already marginal
+  at ~6 cm, shortening it is a decision about read reliability rather than a cleanup.
+  Left alone.
 
 ## Sequencing
 

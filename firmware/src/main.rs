@@ -128,6 +128,7 @@ async fn main(spawner: Spawner) {
     reader::identify(&mut nfc);
     let mut scan = reader::Scan::default();
     reader::start_rf(&mut nfc);
+    reader::bench(&mut nfc);
 
     // Tags are configured by UID in tags.toml. An unset value leaves that device on the
     // BOOT-button fallback, so the firmware is useful before the tags physically arrive.

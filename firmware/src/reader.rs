@@ -117,6 +117,48 @@ pub fn new(spi: esp_hal::peripherals::SPI3<'static>, pins: Pins) -> Reader<'stat
 /// interesting cases are the ones decoding hides: all-`ff` is an absent or unpowered
 /// chip, all-`00` is MISO stuck low, and a plausible-looking value shifted by one byte
 /// is a BUSY handshake that returned too early.
+/// Attribute the cost of an inventory round to its parts.
+///
+/// A round measured 620 ms, which is far more than its SPI traffic can explain: at
+/// 1 MHz the bytes of a whole round are worth under a millisecond. So the question is
+/// what the driver spends between transactions, and the only honest way to answer it is
+/// to time one transaction and one round and let the arithmetic say the rest.
+pub fn bench(reader: &mut Reader<'static>) {
+    const READS: u32 = 200;
+    let started = embassy_time::Instant::now();
+    for _ in 0..READS {
+        let _ = reader.read_register(medienzeit_pn5180::reg::IRQ_STATUS);
+    }
+    let per_read = started.elapsed().as_micros() / READS as u64;
+
+    let mut uids = [medienzeit_pn5180::Uid::default(); 4];
+    let started = embassy_time::Instant::now();
+    let mut found = 0;
+    for _ in 0..5 {
+        found = reader.inventory(&mut uids).unwrap_or(0);
+    }
+    let per_round = started.elapsed().as_micros() / 5;
+
+    println!(
+        "bench: read_register {}us  round {} ({found} tags)",
+        per_read,
+        crate::timing::Ms(per_round)
+    );
+
+    // The driver has no clock, so it counts polls and multiplies by what a poll is
+    // assumed to cost. That assumption governs every timeout in the RF path, and
+    // nothing else would notice it going stale — a slower SPI clock would quietly
+    // stretch every timeout, exactly the bug this bench was written to find.
+    let assumed = medienzeit_pn5180::POLL_COST_US as u64;
+    let drift = per_read.abs_diff(assumed) * 100 / assumed;
+    if drift > 25 {
+        println!(
+            "reader: POLL_COST_US is {assumed}us but a read costs {per_read}us \
+             ({drift}% out) — every RF timeout is wrong by that much"
+        );
+    }
+}
+
 pub fn identify(reader: &mut Reader<'static>) {
     println!("reader: BUSY idle level = {:?}", reader.busy_level());
     for (what, addr, len) in [
