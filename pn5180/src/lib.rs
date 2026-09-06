@@ -222,9 +222,6 @@ pub struct TagSet<const N: usize> {
     missing: [u32; N],
     len: usize,
     limit: u32,
-    /// Last round's raw reading, for confirming newcomers.
-    prev: [Uid; N],
-    prev_len: usize,
 }
 
 impl<const N: usize> TagSet<N> {
@@ -236,8 +233,6 @@ impl<const N: usize> TagSet<N> {
             missing: [0; N],
             len: 0,
             limit,
-            prev: [Uid::default(); N],
-            prev_len: 0,
         }
     }
 
@@ -251,18 +246,27 @@ impl<const N: usize> TagSet<N> {
 
     /// Fold one round's reading in, and return the believed set.
     ///
-    /// # Why a newcomer needs two rounds
+    /// # Why a newcomer is believed on sight
     ///
-    /// The ISO 15693 frame is CRC-protected and the reader checks it in hardware, but
-    /// the SPI link carrying the answer to the host is not protected at all. On dupont
-    /// wiring that link flips bits: measured in service, about two dozen times a day,
-    /// each one a single-bit corruption of a real tag's UID scattered across every byte.
+    /// A newcomer used to need two consecutive rounds, to reject SPI corruption: the
+    /// ISO 15693 frame is CRC-checked in hardware but the link carrying the answer to
+    /// the host is not, and on dupont wiring it was flipping bits about two dozen times
+    /// a day. Requiring the same new UID twice rejected essentially all of them,
+    /// because each corruption is a fresh random value.
     ///
-    /// Each corruption is a fresh random value, so requiring the *same* new UID in two
-    /// consecutive rounds rejects essentially all of them — a flip would have to repeat
-    /// itself exactly. The cost is one extra second before a genuinely new tag is
-    /// believed, against alerts for tags that do not exist and, worse, the chance of a
-    /// corrupted read matching another device's UID.
+    /// It also made acquiring a tag strictly harder than keeping one. Holding tolerates
+    /// `limit` consecutive misses, so one good read in four is enough; acquiring wanted
+    /// two good reads *back to back*. At any distance where reads succeed intermittently
+    /// that gap is wide, and it is felt as a device that will not register until it is
+    /// far closer than the distance at which it would happily stay — with no flapping to
+    /// show for it, because retention smooths what acquisition cannot latch.
+    ///
+    /// Putting a device down is the action this system asks for a dozen times a day, so
+    /// it is the one that has to be easy. The corruption it was defending against was
+    /// separately fixed at its source by halving the SPI clock, and has not been seen
+    /// since. What remains is that a corrupted UID matching *another configured device*
+    /// would be believed silently — which is an argument for keeping the two tag UIDs
+    /// far apart, not for making docking hard.
     pub fn update(&mut self, seen: &[Uid]) -> &[Uid] {
         // Age existing entries, dropping those missing for too long. Iterating downwards
         // keeps the swap-remove from skipping an entry.
@@ -280,18 +284,15 @@ impl<const N: usize> TagSet<N> {
                 }
             }
         }
-        // A tag not already believed joins only if the previous round saw it too.
+        // A tag is believed on sight.
         for uid in seen {
             let known = self.tags[..self.len].contains(uid);
-            let confirmed = self.prev[..self.prev_len].contains(uid);
-            if !known && confirmed && self.len < N {
+            if !known && self.len < N {
                 self.tags[self.len] = *uid;
                 self.missing[self.len] = 0;
                 self.len += 1;
             }
         }
-        self.prev_len = seen.len().min(N);
-        self.prev[..self.prev_len].copy_from_slice(&seen[..self.prev_len]);
         self.tags()
     }
 }
@@ -845,40 +846,50 @@ mod tests {
         Uid([n, 0, 0, 0, 0, 0, 0x04, 0xe0])
     }
 
-    /// A newcomer takes two consecutive rounds, because a single sighting is exactly
-    /// what a corrupted read looks like.
+    /// Putting a device down is asked for a dozen times a day, so it has to take
+    /// effect the moment the reader sees it.
     #[test]
-    fn a_new_tag_needs_confirming() {
+    fn a_new_tag_is_believed_on_sight() {
         let mut set: TagSet<4> = TagSet::new(3);
-        assert!(set.update(&[uid(1)]).is_empty(), "not on the first sighting");
-        assert_eq!(set.update(&[uid(1)]), &[uid(1)], "believed on the second");
+        assert_eq!(set.update(&[uid(1)]), &[uid(1)], "no waiting for a second round");
     }
 
-    /// The failure this exists for: SPI corruption produces a fresh wrong UID each
-    /// time, so no single one ever repeats and none should be believed.
+    /// Acquiring must not be harder than holding. A tag that reads only every other
+    /// round has to latch, not just survive once latched.
     #[test]
-    fn one_off_corruptions_are_never_believed() {
+    fn an_intermittent_tag_still_latches() {
         let mut set: TagSet<4> = TagSet::new(3);
-        for n in 100..120 {
-            set.update(&[uid(n)]);
-        }
-        assert!(set.tags().is_empty(), "a stream of distinct one-offs believes nothing");
+        assert_eq!(set.update(&[uid(1)]), &[uid(1)]);
+        assert_eq!(set.update(&[]), &[uid(1)]);
+        assert_eq!(set.update(&[uid(1)]), &[uid(1)]);
     }
 
-    /// A corrupt read alongside the real tag must not displace it, and must not join.
+    /// A corrupt read alongside the real tag must not displace it.
     #[test]
-    fn a_corrupt_read_beside_a_real_one_changes_nothing() {
+    fn a_corrupt_read_beside_a_real_one_does_not_displace_it() {
         let mut set: TagSet<4> = TagSet::new(3);
-        set.update(&[uid(1)]);
         set.update(&[uid(1)]);
         let after = set.update(&[uid(1), uid(200)]);
-        assert_eq!(after, &[uid(1)]);
+        assert!(after.contains(&uid(1)), "the real tag stays");
+    }
+
+    /// The cost of believing on sight, stated so it is not forgotten: a corrupted UID
+    /// is believed too, and only leaves after `limit` misses. That is tolerable for a
+    /// tag nobody configured — it becomes an alert — and is why the two device UIDs
+    /// should not be one bit apart.
+    #[test]
+    fn a_corruption_is_believed_but_ages_out() {
+        let mut set: TagSet<4> = TagSet::new(3);
+        assert_eq!(set.update(&[uid(200)]), &[uid(200)]);
+        for _ in 0..3 {
+            assert_eq!(set.update(&[]).len(), 1);
+        }
+        assert!(set.update(&[]).is_empty(), "gone after limit+1 misses");
     }
 
     #[test]
     fn a_single_dropped_round_is_tolerated() {
         let mut set: TagSet<4> = TagSet::new(3);
-        set.update(&[uid(1)]);
         set.update(&[uid(1)]);
         assert_eq!(set.update(&[]), &[uid(1)], "one miss must not remove it");
         assert_eq!(set.update(&[uid(1)]), &[uid(1)]);
@@ -887,7 +898,6 @@ mod tests {
     #[test]
     fn a_tag_goes_once_it_stays_missing() {
         let mut set: TagSet<4> = TagSet::new(3);
-        set.update(&[uid(1)]);
         set.update(&[uid(1)]);
         for _ in 0..3 {
             assert_eq!(set.update(&[]).len(), 1);
