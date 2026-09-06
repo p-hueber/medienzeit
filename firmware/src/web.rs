@@ -26,17 +26,11 @@ use medienzeit_core::settings::Settings;
 use static_cell::StaticCell;
 use medienzeit_core::{Flow, Snapshot};
 
-/// Latest snapshot, published by the control loop after every tick.
+/// The rules currently in force, for the form to render.
 ///
 /// A cell rather than a `Signal`: taking from a signal *consumes* it, so two requests
-/// arriving between loop ticks would show the second one stale data. State that is
+/// arriving close together would leave the second with nothing to show. State that is
 /// read repeatedly wants a value, not an event.
-static STATE: Mutex<CriticalSectionRawMutex, RefCell<Option<Snapshot<2>>>> =
-    Mutex::new(RefCell::new(None));
-
-/// The rules currently in force, published by the control loop so the form can show
-/// them. Without this the page would have to guess, and a form pre-filled with guesses
-/// silently rewrites whatever it got wrong the moment it is submitted.
 static CURRENT: Mutex<CriticalSectionRawMutex, RefCell<Option<Settings>>> =
     Mutex::new(RefCell::new(None));
 
@@ -57,12 +51,10 @@ fn current_settings() -> Option<Settings> {
     CURRENT.lock(|c| *c.borrow())
 }
 
-pub fn publish(snapshot: Snapshot<2>) {
-    STATE.lock(|cell| *cell.borrow_mut() = Some(snapshot));
-}
-
+/// The ledger lives in the room half now, so the page reads what it published rather
+/// than keeping a second copy of it here.
 fn latest() -> Option<Snapshot<2>> {
-    STATE.lock(|cell| cell.borrow().clone())
+    crate::shared::snapshot()
 }
 
 /// Bonus minutes requested by the admin page, consumed by the control loop.

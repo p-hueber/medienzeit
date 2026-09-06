@@ -7,7 +7,9 @@ mod net;
 mod notify;
 mod panel;
 mod reader;
+mod room;
 mod rtc;
+mod shared;
 mod storage;
 mod timing;
 mod web;
@@ -16,6 +18,7 @@ mod web;
 use esp_backtrace as _;
 
 use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
 use embassy_net::{Config as NetConfig, StackResources, Stack};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::clock::CpuClock;
@@ -29,8 +32,7 @@ use esp_println::println;
 use heapless::String;
 use static_cell::StaticCell;
 
-use medienzeit_core::{Event, Ledger, Policy, Snapshot};
-use medienzeit_ui::Chrome;
+use medienzeit_core::{Ledger, Policy, Snapshot};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -46,17 +48,8 @@ const DEV_MACS: [&str; 2] = [
 /// How often to ask the FRITZ!Box where the devices are.
 const PRESENCE_PERIOD: Duration = Duration::from_secs(30);
 
-/// How often to journal the balance. A power cut costs at most this much.
-const JOURNAL_PERIOD: Duration = Duration::from_secs(30);
-
 /// Gaps shorter than this are a reboot, not someone pulling the plug.
 const OUTAGE_MIN_SECS: i64 = 5 * 60;
-
-/// Quick refreshes before forcing a full one to clear accumulated ghosting.
-///
-/// At one update per minute that is a flash every half hour, which is roughly the
-/// point at which ghosting becomes noticeable on this panel.
-const QUICK_REFRESHES_PER_FULL: u32 = 30;
 
 /// Socket budget. DHCP, DNS, three admin-server acceptors, one transient TR-064
 /// connection and one transient alert connection — with headroom, because running out
@@ -73,9 +66,8 @@ async fn main(spawner: Spawner) {
     esp_rtos::start(timg0.timer0, sw.software_interrupt0);
     println!("medienzeit: booted");
 
-    start_second_core_spike(p.CPU_CTRL, sw.software_interrupt1);
 
-    let mut panel = panel::Panel::new(
+    let panel = panel::Panel::new(
         p.SPI2,
         panel::Pins {
             power_en: p.GPIO6,
@@ -97,7 +89,7 @@ async fn main(spawner: Spawner) {
     let mut i2c = rtc::bus(p.I2C0, p.GPIO47, p.GPIO48);
     rtc::scan(&mut i2c);
 
-    let mut chime = chime::Chime::new(
+    let chime = chime::Chime::new(
         p.I2S0,
         p.DMA_CH0,
         chime::Pins {
@@ -158,33 +150,30 @@ async fn main(spawner: Spawner) {
         reader::bringup_scan(&mut nfc, &mut scan, 20).await;
     }
 
-    // From here the reader belongs to its own task; the control loop only reads the
-    // docking state it publishes.
-    spawner.spawn(reader::task(nfc, docking, boot_button).unwrap());
-
     // Recover the balance before anything else can spend it.
     let (mut journal, recovered) = storage::Journal::open(p.FLASH);
 
     // Rules come from flash when they have ever been saved, and from the compiled-in
     // defaults otherwise. Stored settings win because they are the more recent decision;
     // a firmware update should not quietly revert a parent's choices.
-    let (mut settings_store, stored) = storage::SettingsStore::open(journal.flash());
-    let mut settings = stored
+    let (settings_store, stored) = storage::SettingsStore::open(journal.flash());
+    let settings = stored
         .unwrap_or_else(|| medienzeit_core::settings::Settings::from_policy(&Policy::default(), 0));
-    let mut policy = settings.to_policy();
+    let policy = settings.to_policy();
     web::publish_settings(settings);
-    let mut ledger = match recovered {
+    let ledger = match recovered {
         Some(rec) => Ledger::<2>::with_balance(rec.balance_secs),
         None => Ledger::<2>::new(&policy),
     };
 
-    let mut screen = Screen::default();
-    let mut now = rtc::startup_time(&mut i2c);
-    if let Some(t) = now {
-        let (snapshot, _) = ledger.tick(t, [true; 2], [false; 2], &policy);
-        screen.draw(&mut panel, &snapshot);
-        web::publish(snapshot.clone());
-    }
+    // Everything that blocks now lives behind this one object, and everything it
+    // exchanges with the async half goes through `shared`. Moving it to core 1 is
+    // therefore a change of where `step` is called from, and nothing else.
+    let mut room = room::Room::new(
+        panel, nfc, scan, docking, boot_button, chime, i2c, ledger, policy,
+    );
+    room.show_startup();
+    spawner.spawn(room::task(room).unwrap());
 
     // --- radio + network -------------------------------------------------
     let (controller, interfaces) =
@@ -227,6 +216,7 @@ async fn main(spawner: Spawner) {
         )
         .unwrap(),
     );
+    spawner.spawn(storage_task(journal, settings_store, recovered).unwrap());
 
     let cfg = net::wait_for_dhcp(stack).await;
     let Some(gateway) = cfg.gateway else {
@@ -234,54 +224,16 @@ async fn main(spawner: Spawner) {
         park().await
     };
 
+    // The room owns the RTC, so the corrected time is handed over rather than applied
+    // here. It is also what releases accounting if the RTC alone was not trustworthy.
     match net::sntp_once(stack, gateway).await {
-        Ok(t) => {
-            if let Ok(before) = rtc::now(&mut i2c) {
-                println!("rtc: drift vs sntp {}s", t - before);
-            }
-            match rtc::set(&mut i2c, t) {
-                Ok(()) => println!("rtc: set from sntp"),
-                Err(e) => println!("rtc: set failed ({e:?})"),
-            }
-            now = Some(t);
-        }
+        Ok(t) => shared::SNTP.signal(t),
         Err(e) => println!("medienzeit: SNTP failed: {e}"),
     }
 
-    let Some(start) = now else {
-        println!("medienzeit: no trustworthy clock, not accounting");
-        park().await
-    };
-
-    // Now that the clock is trustworthy, work out how long the unit was off. The gap
-    // is never billed — a real power cut must not cost her the evening — but "unplug
-    // it" is otherwise the obvious way to stop the clock, so it gets reported.
-    if let Some(rec) = recovered {
-        if let Some(outage) = medienzeit_core::journal::detect_outage(
-            rec.last_tick,
-            start,
-            OUTAGE_MIN_SECS,
-        ) {
-            // Report seconds under two minutes: integer minutes would round a real
-            // outage down to "0 min", which reads as nothing having happened.
-            let secs = outage.secs();
-            if secs < 120 {
-                println!("  [alert] unit was off for {secs}s");
-                let mut m: notify::Message = heapless::String::new();
-                let _ = write!(m, "Gerät war {secs}s aus");
-                notify::send(&m);
-            } else {
-                println!("  [alert] unit was off for {} min", secs / 60);
-                let mut m: notify::Message = heapless::String::new();
-                let _ = write!(m, "Gerät war {} min aus", secs / 60);
-                notify::send(&m);
-            }
-        }
-    }
-
-    // --- control loop ----------------------------------------------------
+    // --- enforcement loop ------------------------------------------------
     let mut fb = fritzbox::Client::new(gateway);
-    let mut state = Control::new(start);
+    let mut state = Control::new();
 
     // Reconcile with whatever the box already believes, rather than assuming.
     state.refresh_presence(&mut fb, stack).await;
@@ -299,48 +251,12 @@ async fn main(spawner: Spawner) {
     }
 
     let mut last_presence = Instant::now();
-    let mut last_journal = Instant::now();
-    let mut last_persisted_flow = None;
-
     loop {
-        // The RTC is authoritative between SNTP syncs, so a missed tick or a slow
-        // network call cannot make the ledger lose time.
-        let t = rtc::now(&mut i2c).unwrap_or(state.last_tick + 1);
-
         // A rules change from the admin page arrives out of band. Persist first, so a
         // power cut immediately after cannot leave the running rules and the stored
         // ones disagreeing — the stored ones are what the next boot believes.
         if let Some(new) = web::take_settings() {
-            if settings_store.save(journal.flash(), new) {
-                settings = new;
-                policy = settings.to_policy();
-                web::publish_settings(settings);
-                println!("medienzeit: rules updated");
-            }
-        }
-
-        // A grant from the admin page arrives out of band; apply it before the tick
-        // so the new balance is what gets journalled and displayed this second.
-        if let Some(secs) = web::BONUS.try_take() {
-            ledger.grant_bonus(secs, &policy);
-            println!("medienzeit: +{}s granted", secs);
-        }
-
-        // Docking comes from the reader task, which owns the SPI side.
-        let docked = reader::docked();
-
-        let (snapshot, events) = ledger.tick(t, docked, state.present, &policy);
-        state.last_tick = t;
-
-        for e in &events {
-            report(e);
-            // The chime exists for exactly one event. Everything else is on the
-            // display, where it can be read rather than interpreted.
-            if matches!(e, Event::Warning) {
-                if let Some(c) = chime.as_mut() {
-                    c.warning();
-                }
-            }
+            SETTINGS_REQ.signal(new);
         }
 
         if last_presence.elapsed() >= PRESENCE_PERIOD {
@@ -348,23 +264,82 @@ async fn main(spawner: Spawner) {
             state.refresh_presence(&mut fb, stack).await;
         }
 
-        state.apply_blocks(&mut fb, stack, &snapshot).await;
-
-        screen.draw(&mut panel, &snapshot);
-        web::publish(snapshot.clone());
-
-        // Journal on a timer, and immediately whenever the flow changes — the moment
-        // spending starts or stops is exactly when a stale record would be wrong by
-        // the largest amount.
-        let flow_changed = last_persisted_flow != Some(snapshot.flow);
-        if flow_changed || last_journal.elapsed() >= JOURNAL_PERIOD {
-            last_journal = Instant::now();
-            last_persisted_flow = Some(snapshot.flow);
-            journal.append(snapshot.balance_secs, t);
+        // Enforcement follows what the room last computed. Nothing to do until the
+        // ledger has produced a snapshot.
+        if let Some(snapshot) = shared::snapshot() {
+            state.apply_blocks(&mut fb, stack, &snapshot).await;
         }
 
         Timer::after(Duration::from_secs(1)).await;
     }
+}
+
+/// A settings change waiting to be written. Set by the enforcement loop, consumed by
+/// the storage task, which is the only thing holding the flash.
+static SETTINGS_REQ: embassy_sync::signal::Signal<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    medienzeit_core::settings::Settings,
+> = embassy_sync::signal::Signal::new();
+
+/// Owns the flash, and is the only thing that writes to it.
+///
+/// Journalling is edge-driven — the room signals when the flow changes or the timer is
+/// due — so this sleeps rather than polls. Flash writes block, but briefly: under a
+/// millisecond for a record, tens of milliseconds for the roughly hourly sector erase.
+#[embassy_executor::task]
+async fn storage_task(
+    mut journal: storage::Journal<'static>,
+    mut settings_store: storage::SettingsStore,
+    recovered: Option<medienzeit_core::journal::Record>,
+) {
+    // Outage detection needs a trustworthy wall clock, and the first journal request is
+    // the earliest proof there is one — the room does not tick until then. Held as
+    // pending rather than waited on, because a device whose clock never becomes
+    // trustworthy must still be able to save its settings.
+    let mut outage_pending = recovered;
+
+    loop {
+        match select(shared::PERSIST.wait(), SETTINGS_REQ.wait()).await {
+            Either::First((balance, t)) => {
+                journal.append(balance, t);
+                if let Some(rec) = outage_pending.take() {
+                    report_outage(rec.last_tick, t);
+                }
+            }
+            Either::Second(new) => {
+                if settings_store.save(journal.flash(), new) {
+                    // Published only on a successful write, so the running rules can
+                    // never be ones that failed to persist.
+                    shared::publish_policy(new.to_policy());
+                    web::publish_settings(new);
+                    println!("medienzeit: rules updated");
+                }
+            }
+        }
+    }
+}
+
+/// Report how long the unit was off.
+///
+/// The gap is never billed — a real power cut must not cost her the evening — but
+/// "unplug it" is otherwise the obvious way to stop the clock, so it gets said out loud.
+fn report_outage(last_tick: i64, now: i64) {
+    let Some(outage) = medienzeit_core::journal::detect_outage(last_tick, now, OUTAGE_MIN_SECS)
+    else {
+        return;
+    };
+    // Report seconds under two minutes: integer minutes would round a real outage down
+    // to "0 min", which reads as nothing having happened.
+    let secs = outage.secs();
+    let mut m: notify::Message = heapless::String::new();
+    if secs < 120 {
+        println!("  [alert] unit was off for {secs}s");
+        let _ = write!(m, "Gerät war {secs}s aus");
+    } else {
+        println!("  [alert] unit was off for {} min", secs / 60);
+        let _ = write!(m, "Gerät war {} min aus", secs / 60);
+    }
+    notify::send(&m);
 }
 
 struct Control {
@@ -372,16 +347,14 @@ struct Control {
     ips: [Option<String<46>>; 2],
     /// What we have actually told the box, so we only issue changes.
     applied: [Option<bool>; 2],
-    last_tick: i64,
 }
 
 impl Control {
-    fn new(start: i64) -> Self {
+    fn new() -> Self {
         Self {
             present: [false; 2],
             ips: [None, None],
             applied: [None, None],
-            last_tick: start,
         }
     }
 
@@ -415,6 +388,7 @@ impl Control {
                 Err(e) => println!("presence: {} lookup failed ({e:?})", DEV_NAMES[i]),
             }
         }
+        shared::publish_presence(self.present);
     }
 
     async fn apply_blocks(
@@ -453,108 +427,6 @@ fn label(blocked: bool) -> &'static str {
     }
 }
 
-/// Everything the screen actually shows. Redrawing on anything else wastes a refresh.
-type Fingerprint = (i32, u32, u32, bool, medienzeit_core::Flow, [bool; 2]);
-
-fn fingerprint(s: &Snapshot<2>) -> Fingerprint {
-    (
-        s.balance_secs / 60,
-        s.local.hour,
-        s.local.minute,
-        s.night,
-        s.flow,
-        s.docked,
-    )
-}
-
-/// Decides *whether* to redraw and *how*.
-///
-/// E-paper updates are slow and the panel has a finite number of them, so the screen
-/// is only touched when something visible changed. Most of those changes are one digit
-/// of a countdown, which the quick waveform handles without flashing the whole panel.
-#[derive(Default)]
-struct Screen {
-    last: Option<Fingerprint>,
-    quick_since_full: u32,
-}
-
-impl Screen {
-    fn draw(&mut self, panel: &mut panel::Panel<'static>, snapshot: &Snapshot<2>) {
-        let now = fingerprint(snapshot);
-        let Some(previous) = self.last else {
-            // First frame of the session: nothing is on the panel we can trust.
-            self.present(panel, snapshot, now, panel::Refresh::Full);
-            return;
-        };
-        if previous == now {
-            return;
-        }
-
-        // A lockout is the one transition that inverts the entire screen. Doing that
-        // with the quick waveform leaves the old image ghosted through the new one,
-        // which is exactly when legibility matters most.
-        let lockout_changed = previous.3 != now.3 || (previous.0 <= 0) != (now.0 <= 0);
-        let mode = if lockout_changed || self.quick_since_full >= QUICK_REFRESHES_PER_FULL {
-            panel::Refresh::Full
-        } else {
-            panel::Refresh::Quick
-        };
-        self.present(panel, snapshot, now, mode);
-    }
-
-    fn present(
-        &mut self,
-        panel: &mut panel::Panel<'static>,
-        snapshot: &Snapshot<2>,
-        fp: Fingerprint,
-        mode: panel::Refresh,
-    ) {
-        // Timed because this is the longest blocking call in the firmware and its cost
-        // was, until measured, a datasheet typical. Logged per call: at roughly one a
-        // minute it is not noise, and the full/quick difference is the whole point.
-        let started = Instant::now();
-        show(panel, snapshot, mode);
-        println!(
-            "screen: {:?} redraw at {:02}:{:02}, balance {}s, took {}",
-            mode,
-            snapshot.local.hour,
-            snapshot.local.minute,
-            snapshot.balance_secs,
-            timing::Ms(started.elapsed().as_micros())
-        );
-        self.last = Some(fp);
-        self.quick_since_full = match mode {
-            panel::Refresh::Full => 0,
-            panel::Refresh::Quick => self.quick_since_full + 1,
-        };
-    }
-}
-
-/// Log every event; push only the ones a parent would want to know about away from
-/// the house. Alerting on routine transitions would train you to ignore the channel,
-/// which costs more than the missed information.
-fn report(e: &Event) {
-    let mut push: notify::Message = heapless::String::new();
-    match e {
-        Event::Exhausted => {
-            println!("  [event] EXHAUSTED");
-            let _ = push.push_str("Zeit ist aufgebraucht");
-        }
-        Event::UndockedAtNight { device } => {
-            println!("  [event] {} TAKEN AWAY AT NIGHT", DEV_NAMES[*device]);
-            let _ = write!(push, "{} nachts weggenommen", DEV_NAMES[*device]);
-        }
-        Event::Restored => println!("  [event] restored"),
-        Event::Warning => println!("  [event] 5 minutes left"),
-        Event::NightBegan => println!("  [event] night began"),
-        Event::NightEnded => println!("  [event] night ended"),
-        Event::TimeJump { gap_secs } => println!("  [event] time jump {gap_secs}s ignored"),
-    }
-    if !push.is_empty() {
-        notify::send(&push);
-    }
-}
-
 /// Dotted-quad to an address, at runtime because `env!` yields a string.
 ///
 /// An empty or unparseable value yields `None`, meaning "resolve by name instead".
@@ -568,52 +440,10 @@ fn parse_ipv4(s: &str) -> Option<embassy_net::IpAddress> {
     (n == 4).then(|| embassy_net::IpAddress::v4(octets[0], octets[1], octets[2], octets[3]))
 }
 
-fn show(panel: &mut panel::Panel<'static>, snapshot: &Snapshot<2>, mode: panel::Refresh) {
-    let mut fbuf = panel::framebuffer();
-    let chrome = Chrome { device_names: DEV_NAMES };
-    medienzeit_ui::render(&mut panel::InkTarget(&mut fbuf), snapshot, &chrome).unwrap();
-    panel.present(&fbuf, mode);
-}
-
+/// Nothing more to do on this half, but the room keeps running: the reader and the
+/// display do not need the network.
 async fn park() -> ! {
     loop {
         Timer::after(Duration::from_secs(30)).await;
     }
-}
-
-/// Step 0 of the two-core split: prove the second core is survivable before refactoring
-/// for it. See `docs/two-core-split.md`.
-///
-/// Starting core 1 makes the esp-rtos scheduler SMP, under a Wi-Fi stack that has only
-/// ever run single-core here. That is the one risk that would invalidate the whole
-/// design, so it is tested alone, with a core that does nothing but prove it is alive.
-///
-/// It is started *before* Wi-Fi deliberately: initialising the radio while the second
-/// core runs is the harshest ordering, and the point is to fail now rather than after
-/// the refactor.
-///
-/// The heartbeat is what makes flash parking visible. Every journal write parks this
-/// core (`storage::Journal::open` asks for `multicore_auto_park`), so a beat that stops
-/// or a system that wedges around a write is the failure this spike is looking for.
-fn start_second_core_spike(
-    cpu_ctrl: esp_hal::peripherals::CPU_CTRL<'static>,
-    int1: esp_hal::interrupt::software::SoftwareInterrupt<'static, 1>,
-) {
-    /// Sized for the eventual `room` loop, whose stack has to hold the 5 KB framebuffer
-    /// that `show` builds as a local. Oversized for a heartbeat, but this is the number
-    /// the real split needs, so it is the number worth proving.
-    // Spelled out rather than imported: `embassy_net::Stack` is already in scope here
-    // and means something entirely different.
-    static STACK: StaticCell<esp_hal::system::Stack<16384>> = StaticCell::new();
-
-    esp_rtos::start_second_core(cpu_ctrl, int1, STACK.init(esp_hal::system::Stack::new()), || {
-        println!("core1: running");
-        let mut beats = 0u32;
-        loop {
-            esp_rtos::CurrentThreadHandle::get()
-                .delay(esp_hal::time::Duration::from_secs(5));
-            beats += 1;
-            println!("core1: alive, {beats} beats");
-        }
-    });
 }

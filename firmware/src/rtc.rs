@@ -37,6 +37,9 @@ pub enum Error {
 /// Returns [`codec::Error::ClockIntegrityLost`] when the oscillator-stop flag is set,
 /// which is what a fresh or power-cut board reports. That is a normal startup state,
 /// not a fault.
+/// The onboard I²C bus, shared by the RTC and the audio codec.
+pub type Bus<'d> = I2c<'d, Blocking>;
+
 pub fn now(i2c: &mut I2c<'_, Blocking>) -> Result<i64, Error> {
     let mut regs = [0u8; codec::TIME_REGS];
     i2c.write_read(codec::ADDRESS, &[codec::REG_SECONDS], &mut regs)
