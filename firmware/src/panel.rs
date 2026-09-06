@@ -173,11 +173,22 @@ impl Panel<'static> {
         Self { spi, epd, delay, asleep: false, lut: None, _power: power }
     }
 
-    /// Push a framebuffer and refresh, then put the controller back to sleep.
+    /// Push a framebuffer and refresh.
     ///
-    /// Waking is not optional: the controller ignores commands in deep sleep, so
-    /// without this the second update of the session would silently do nothing while
-    /// every call still reported success.
+    /// The controller is deliberately **not** put back to deep sleep between updates.
+    /// It used to be, and waking re-runs initialisation — which a partial refresh
+    /// cannot survive, because a partial update is a differential drive against the
+    /// controller's previous image. Re-initialising between every frame throws that
+    /// state away, and what reaches the panel is a waveform computed against something
+    /// that is no longer true. The symptom is ink that should have been cleared
+    /// lingering as a faint outline of the previous digit.
+    ///
+    /// Sleeping bought a few microamps on a mains-powered device that never moves,
+    /// which was never worth it. After `display_frame` the controller has already shut
+    /// its own analog rail and clock down, so idle draw here is not the concern the
+    /// sleep call implied it was.
+    ///
+    /// Waking still has to be handled once, for the first frame after boot.
     pub fn present(&mut self, fb: &Framebuffer, mode: Refresh) {
         if self.asleep {
             let _ = self.epd.wake_up(&mut self.spi, &mut self.delay);
@@ -195,7 +206,5 @@ impl Panel<'static> {
 
         let _ = self.epd.update_frame(&mut self.spi, fb.buffer(), &mut self.delay);
         let _ = self.epd.display_frame(&mut self.spi, &mut self.delay);
-        let _ = self.epd.sleep(&mut self.spi, &mut self.delay);
-        self.asleep = true;
     }
 }

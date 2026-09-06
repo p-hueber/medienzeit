@@ -179,12 +179,15 @@ impl Room {
         let Some(mode) = self.screen.decide(fp) else {
             return;
         };
-        // Timed because this is the longest blocking call in the firmware, and its cost
-        // was a datasheet typical until it was measured.
+        // What is timed here is how long the room is held up, not how long the panel
+        // takes. Since the controller is no longer put to sleep afterwards, nothing
+        // waits for the refresh to finish: the commands are issued and the panel
+        // completes on its own, and whichever call comes next waits out BUSY. The
+        // physical refresh is still about a second, or nearly two for a full one.
         let started = Instant::now();
         show(&mut self.panel, self.fbuf, snapshot, mode.into());
         println!(
-            "screen: {:?} redraw at {:02}:{:02}, balance {}s, took {}",
+            "screen: {:?} redraw at {:02}:{:02}, balance {}s, issued in {}",
             mode,
             snapshot.local.hour,
             snapshot.local.minute,
