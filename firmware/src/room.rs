@@ -38,9 +38,9 @@ pub struct Room {
     last_tick: Option<i64>,
     last_journal: Instant,
     last_persisted_flow: Option<medienzeit_core::Flow>,
-    /// Held rather than built per redraw. At 200x200 mono it is 5 KB, and on the stack
-    /// it would set the floor for core 1's stack size on a device with no DRAM to spare.
-    fbuf: panel::Framebuffer,
+    /// Held rather than built per redraw, and behind a reference so `Room` itself stays
+    /// small enough to construct as a local. At 200x200 mono it is 5 KB.
+    fbuf: &'static mut panel::Framebuffer,
     round: crate::timing::Stats,
     last_docked: [bool; 2],
     last_recoveries: u32,
@@ -182,7 +182,7 @@ impl Room {
         // Timed because this is the longest blocking call in the firmware, and its cost
         // was a datasheet typical until it was measured.
         let started = Instant::now();
-        show(&mut self.panel, &mut self.fbuf, snapshot, mode.into());
+        show(&mut self.panel, self.fbuf, snapshot, mode.into());
         println!(
             "screen: {:?} redraw at {:02}:{:02}, balance {}s, took {}",
             mode,
@@ -324,3 +324,12 @@ fn report(e: &Event) {
         crate::notify::send(&push);
     }
 }
+
+// Sizes that decide whether `Room` can be built on a stack at all. Asserted rather than
+// remembered: the panic when it stops holding is a stack overflow before the first
+// println, which is a long way from pointing at this struct.
+const _: () = {
+    if core::mem::size_of::<Room>() > 1024 {
+        panic!("Room is too large to construct as a local; give its buffers their own statics");
+    }
+};

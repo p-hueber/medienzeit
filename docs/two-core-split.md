@@ -273,7 +273,31 @@ Two things the flip needed that the plan had not anticipated:
   the closure stays pointer-sized and the object is placed where it can be accounted
   for.
 
-**Step 3 — remeasure** against step 0's numbers. Outstanding, and it needs hardware.
+**Step 3 — remeasure.** **Done, on hardware.**
+
+| | Before | After |
+|---|---|---|
+| Worst web latency across a redraw | ~1 s (the redraw blocked the executor) | **224 ms**, measured against a 1052 ms redraw in the same window |
+| Reader round | 620 ms | **189 ms**, steady |
+| Full / quick refresh | 1812 / 1050 ms | unchanged — but now on core 1 |
+
+Also verified: the balance survived the reflash (`recovered balance 3616s`), the SNTP
+correction crossed from core 0 and was applied to the RTC, a settings POST answered
+`Gespeichert.` in 0.29 s having actually waited for the write, an unauthenticated POST
+was refused with 401 and did not reach the flash, and an invalid one was refused by name.
+Two minutes of soak afterwards: no faults, no RF recoveries, no unknown tags.
+
+### The flip did not work first time
+
+It panicked before the first `println`: `stack pointer out of range`. `Room` was ~25 KB —
+`Chime`'s tone buffer is 19 KB at 24 kHz for 400 ms, plus the 5 KB framebuffer — and was
+being built as a local on the main thread's ~30 KB stack while the `chime` local was
+still alive.
+
+Both buffers now live in their own `StaticCell`s and are held by reference, which puts
+`Room` under 1 KB. There is a `const` assertion on `size_of::<Room>()` to say so,
+because the failure it prevents is a stack overflow before any output exists — a very
+long way from pointing at this struct.
 
 ## What this changes elsewhere
 

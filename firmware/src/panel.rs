@@ -39,8 +39,13 @@ pub const ROTATION: DisplayRotation = DisplayRotation::Rotate90;
 ///
 /// Always construct through this: a plain `Framebuffer::default()` is unrotated, and the
 /// mistake shows up as a picture that is merely sideways rather than as an error.
-pub fn framebuffer() -> Framebuffer {
-    let mut fb = Framebuffer::default();
+/// The framebuffer, in `.bss` rather than on a stack.
+///
+/// 5 KB, and whoever holds it would otherwise have to be built somewhere that can carry
+/// it. Callable once; the room owns it for the lifetime of the program.
+pub fn framebuffer() -> &'static mut Framebuffer {
+    static FB: static_cell::StaticCell<Framebuffer> = static_cell::StaticCell::new();
+    let fb = FB.init(Framebuffer::default());
     fb.set_rotation(ROTATION);
     fb
 }

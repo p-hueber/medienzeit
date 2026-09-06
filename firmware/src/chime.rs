@@ -57,7 +57,9 @@ pub struct Chime<'d> {
     tx: I2sTx<'d, Blocking>,
     pa_ctrl: Output<'d>,
     delay: Delay,
-    buf: [i16; MAX_SAMPLES],
+    /// Behind a reference, not inline: at 24 kHz for 400 ms this is 19 KB, and a
+    /// `Chime` that size cannot be built as a local without overflowing the stack.
+    buf: &'static mut [i16; MAX_SAMPLES],
 }
 
 pub struct Pins {
@@ -147,7 +149,8 @@ impl Chime<'static> {
         let pa_ctrl = Output::new(pins.pa_ctrl, Level::Low, OutputConfig::default());
 
         println!("chime: ready");
-        Some(Self { tx, pa_ctrl, delay, buf: [0; MAX_SAMPLES] })
+        static BUF: static_cell::StaticCell<[i16; MAX_SAMPLES]> = static_cell::StaticCell::new();
+        Some(Self { tx, pa_ctrl, delay, buf: BUF.init([0; MAX_SAMPLES]) })
     }
 
     /// Play a single tone. `ms` is clamped to [`MAX_TONE_MS`].
