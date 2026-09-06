@@ -169,11 +169,24 @@ async fn main(spawner: Spawner) {
     // Everything that blocks now lives behind this one object, and everything it
     // exchanges with the async half goes through `shared`. Moving it to core 1 is
     // therefore a change of where `step` is called from, and nothing else.
-    let mut room = room::Room::new(
+    let room = room::Room::new(
         panel, nfc, scan, docking, boot_button, chime, i2c, ledger, policy,
     );
-    room.show_startup();
-    spawner.spawn(room::task(room).unwrap());
+    // Core 1 is the room. It gets every blocking driver and the ledger, and runs a
+    // plain synchronous loop with no executor; core 0 keeps the network stack and stays
+    // async. The two meet only through `shared`.
+    //
+    // In a StaticCell rather than moved into the closure so the object lives in .bss
+    // and core 1's stack only has to cover call frames.
+    static ROOM: StaticCell<room::Room> = StaticCell::new();
+    static ROOM_STACK: StaticCell<esp_hal::system::Stack<12288>> = StaticCell::new();
+    let room = ROOM.init(room);
+    esp_rtos::start_second_core(
+        p.CPU_CTRL,
+        sw.software_interrupt1,
+        ROOM_STACK.init(esp_hal::system::Stack::new()),
+        move || room.run(),
+    );
 
     // --- radio + network -------------------------------------------------
     let (controller, interfaces) =

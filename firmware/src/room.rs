@@ -43,6 +43,9 @@ pub struct Room {
     last_tick: Option<i64>,
     last_journal: Instant,
     last_persisted_flow: Option<medienzeit_core::Flow>,
+    /// Held rather than built per redraw. At 200x200 mono it is 5 KB, and on the stack
+    /// it would set the floor for core 1's stack size on a device with no DRAM to spare.
+    fbuf: panel::Framebuffer,
     round: crate::timing::Stats,
     last_docked: [bool; 2],
     last_recoveries: u32,
@@ -75,6 +78,7 @@ impl Room {
             last_tick: None,
             last_journal: Instant::now(),
             last_persisted_flow: None,
+            fbuf: panel::framebuffer(),
             round: crate::timing::Stats::new("reader round", 60),
             // Matches Docking's own starting assumption, so the first real reading logs
             // a transition only if it actually differs.
@@ -94,7 +98,7 @@ impl Room {
         };
         self.last_tick = Some(t);
         let (snapshot, _) = self.ledger.tick(t, [true; 2], [false; 2], &self.policy);
-        self.screen.draw(&mut self.panel, &snapshot);
+        self.screen.draw(&mut self.panel, &mut self.fbuf, &snapshot);
         shared::publish_snapshot(snapshot);
     }
 
@@ -134,9 +138,36 @@ impl Room {
             }
         }
 
-        self.screen.draw(&mut self.panel, &snapshot);
+        self.screen.draw(&mut self.panel, &mut self.fbuf, &snapshot);
         shared::publish_snapshot(snapshot.clone());
         self.maybe_persist(&snapshot, t);
+    }
+
+    /// Run the room forever. This is core 1's main thread.
+    ///
+    /// Paced to a deadline rather than by sleeping a second at the end, because the work
+    /// takes a large and variable fraction of the period: a redraw is about a second on its
+    /// own, so `delay(1s)` after the work would make the real cadence closer to two.
+    ///
+    /// A late iteration gives up the beat it missed instead of running twice to catch up.
+    /// Nothing is owed — `Ledger::tick` bills from the RTC timestamp, so a skipped beat
+    /// costs no time, and running two reader rounds back to back would only make the
+    /// overrun worse.
+    pub fn run(&mut self) -> ! {
+        use esp_hal::time::{Duration, Instant};
+        const PERIOD: Duration = Duration::from_secs(1);
+
+        // Done here rather than by the caller so core 0 is not held up by a full refresh,
+        // which is the better part of two seconds.
+        self.show_startup();
+
+        let mut next = Instant::now() + PERIOD;
+        loop {
+            esp_rtos::CurrentThreadHandle::get().delay_until(next);
+            self.step();
+            let now = Instant::now();
+            next = if next > now { next + PERIOD } else { now + PERIOD };
+        }
     }
 
     /// Apply a validated wall clock to the RTC, if the network has produced one.
@@ -259,11 +290,16 @@ struct Screen {
 }
 
 impl Screen {
-    fn draw(&mut self, panel: &mut panel::Panel<'static>, snapshot: &Snapshot<2>) {
+    fn draw(
+        &mut self,
+        panel: &mut panel::Panel<'static>,
+        fbuf: &mut panel::Framebuffer,
+        snapshot: &Snapshot<2>,
+    ) {
         let now = fingerprint(snapshot);
         let Some(previous) = self.last else {
             // First frame of the session: nothing is on the panel we can trust.
-            self.present(panel, snapshot, now, panel::Refresh::Full);
+            self.present(panel, fbuf, snapshot, now, panel::Refresh::Full);
             return;
         };
         if previous == now {
@@ -279,12 +315,13 @@ impl Screen {
         } else {
             panel::Refresh::Quick
         };
-        self.present(panel, snapshot, now, mode);
+        self.present(panel, fbuf, snapshot, now, mode);
     }
 
     fn present(
         &mut self,
         panel: &mut panel::Panel<'static>,
+        fbuf: &mut panel::Framebuffer,
         snapshot: &Snapshot<2>,
         fp: Fingerprint,
         mode: panel::Refresh,
@@ -292,7 +329,7 @@ impl Screen {
         // Timed because this is the longest blocking call in the firmware and its cost
         // was, until measured, a datasheet typical.
         let started = Instant::now();
-        show(panel, snapshot, mode);
+        show(panel, fbuf, snapshot, mode);
         println!(
             "screen: {:?} redraw at {:02}:{:02}, balance {}s, took {}",
             mode,
@@ -309,11 +346,15 @@ impl Screen {
     }
 }
 
-fn show(panel: &mut panel::Panel<'static>, snapshot: &Snapshot<2>, mode: panel::Refresh) {
-    let mut fbuf = panel::framebuffer();
+fn show(
+    panel: &mut panel::Panel<'static>,
+    fbuf: &mut panel::Framebuffer,
+    snapshot: &Snapshot<2>,
+    mode: panel::Refresh,
+) {
     let chrome = medienzeit_ui::Chrome { device_names: DEV_NAMES };
-    medienzeit_ui::render(&mut panel::InkTarget(&mut fbuf), snapshot, &chrome).unwrap();
-    panel.present(&fbuf, mode);
+    medienzeit_ui::render(&mut panel::InkTarget(fbuf), snapshot, &chrome).unwrap();
+    panel.present(fbuf, mode);
 }
 
 /// Log every event; push only the ones a parent would want to know about away from the
@@ -339,19 +380,5 @@ fn report(e: &Event) {
     }
     if !push.is_empty() {
         crate::notify::send(&push);
-    }
-}
-
-/// Drives [`Room::step`] at 1 Hz.
-///
-/// A task on core 0 for now, which blocks the executor exactly as the old control loop
-/// did. Step 2 replaces this with a plain thread on core 1; `Room` itself does not
-/// change, which is the whole reason `step` is a method and not a loop.
-#[embassy_executor::task]
-pub async fn task(mut room: Room) {
-    let mut ticker = embassy_time::Ticker::every(embassy_time::Duration::from_secs(1));
-    loop {
-        ticker.next().await;
-        room.step();
     }
 }

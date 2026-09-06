@@ -259,9 +259,21 @@ and the journal still writes. Ten lines, and it retires risk 1 before any refact
 into `room()` and an async remainder, still both on core 0. Behaviour identical, and the
 whole thing is bench-verifiable.
 
-**Step 2 — flip.** Move `room()` into the `start_second_core` closure.
+**Step 2 — flip.** **Done.** `Room` moved into the `start_second_core` closure, driven
+by `Room::run` on core 1's main thread. `Room` itself was not touched, which is what the
+`step` shape was for.
 
-**Step 3 — remeasure** against step 0's numbers.
+Two things the flip needed that the plan had not anticipated:
+
+- **The framebuffer had to come off the stack.** `show` built it as a 5 KB local, which
+  would have set the floor for core 1's stack on a device with no DRAM to spare. It is a
+  field of `Room` now, so it lives in `.bss` and the stack only covers call frames —
+  12 KB, not the 16 KB budgeted.
+- **`Room` lives in a `StaticCell`**, not moved into the closure, for the same reason:
+  the closure stays pointer-sized and the object is placed where it can be accounted
+  for.
+
+**Step 3 — remeasure** against step 0's numbers. Outstanding, and it needs hardware.
 
 ## What this changes elsewhere
 
