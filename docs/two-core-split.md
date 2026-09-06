@@ -5,10 +5,14 @@
 Every task in the firmware shares one thread-mode executor, so cooperative scheduling
 means one task's blocking call is every task's blocking call. Five places block:
 
+Measured on hardware 2026-09-06, not estimated. The first two lines came in far worse
+than the guesses this plan originally carried (~2 s / "a few hundred ms" for the panel,
+~200 ms for the reader), which strengthens the case rather than weakening it.
+
 | Where | Cost per call | How often |
 |---|---|---|
-| `panel.present()` — `panel.rs:166`, via `Screen::draw` at `main.rs:452` | full refresh ~2 s, quick a few hundred ms (SSD1681 typical — **not measured here**) | quick ~1/min, full every 30 quicks or on lockout |
-| `reader::task` 16-slot inventory — `reader.rs:456` | ~200 ms | 1 Hz, so ~20% duty |
+| `panel.present()` — `panel.rs:166`, via `Screen::draw` at `main.rs:452` | **full 1812 ms, quick ~1050 ms** | quick ~1/min, full every 30 quicks or on lockout |
+| `reader::task` 16-slot inventory — `reader.rs:456` | **avg 610–620 ms, max 1208 ms** | 1 Hz, so **~62% duty** |
 | `chime.warning()` — `chime.rs:200` | up to 1 s, capped by the assert at `chime.rs:53` | one event, and currently silent |
 | `journal.append()` / `settings_store.save()` — `main.rs:357`, `:308` | <1 ms for a 20-byte record; tens of ms for a 4 KB sector erase | record every 30 s; erase ~hourly (`storage.rs:8`) |
 | `rtc::now(&mut i2c)` — `main.rs:303` | ~1 ms | 1 Hz |
@@ -150,13 +154,20 @@ elapsed time correctly rather than losing a second.
 
 | Case | Cost | Frequency |
 |---|---|---|
-| idle | ~200 ms reader + ~1 ms RTC | most seconds |
-| quick refresh | ~600 ms | ~1/min |
-| full refresh | ~2.2 s — **misses the deadline** | every ~30 min |
+| idle | ~620 ms reader + ~1 ms RTC | most seconds |
+| quick refresh | ~1.7 s — **misses the deadline** | ~1/min |
+| full refresh | ~2.4 s — **misses the deadline** | every ~30 min |
 | chime | +1 s | per Warning event |
 
-Only the full refresh overruns, costing up to 2 s of reader detection latency against a
-180 s grace window.
+**Every redraw overruns, not just the full ones.** An earlier draft of this plan claimed
+only the full refresh missed the deadline; that was based on estimates that measurement
+disproved. Worst-case reader detection latency is therefore ~2.4 s, against a 180 s grace
+window — still immaterial, and accounting is unaffected because `tick` is driven by the
+RTC timestamp rather than by iteration count.
+
+The honest summary is that core 1 will be busy roughly two thirds of the time and will
+skip a beat once a minute. That is fine for what it does, and it is precisely why none of
+it belongs on the core running the network stack.
 
 **Not attempted: concurrency within core 1.** esp-rtos 0.3 exposes no thread-spawn API,
 so the only mechanism is an interrupt executor — and putting a 200 ms blocking SPI round
@@ -197,9 +208,27 @@ core 1's `Stack<N>` and watch the guard.
 4. **Interleaved logs — a non-issue.** `esp-println` takes an `esp_sync::RawMutex`
    (`lib.rs:540`), so concurrent `println!` from two cores will not garble.
 
+## Step 0 result (2026-09-06): go
+
+Flashed with core 1 started *before* Wi-Fi, running nothing but a 5 s heartbeat.
+
+- **esp-radio survives SMP.** Associated, DHCP lease, `rtc: drift vs sntp 0s`. This was
+  the risk that could have killed the design; it did not materialise.
+- **Auto-park works.** No `journal: write failed` across ~5 appends. Appends are silent
+  on success and loud on failure (`storage.rs:115`), and with the old default
+  (`MultiCoreStrategy::Error`) every one would have failed once core 1 existed.
+- **The heartbeat never missed**, including across journal writes.
+- Balance survived the reflash: `journal: recovered balance 7956s from slot 575`.
+
+Open question the numbers raise: **620 ms for a 16-slot inventory is suspicious.** The
+SPI traffic is tiny even at 1 MHz, so the time is almost certainly fixed delays or
+timeouts in the driver — roughly 38 ms per slot. It is the single largest CPU consumer in
+the firmware and may be cheap to cut. Worth investigating on its own, independently of
+this refactor.
+
 ## Sequencing
 
-**Step 0 — measure and spike, one flash.** Bracket `panel.present()` and the reader
+**Step 0 — measure and spike, one flash.** **Done.** Bracket `panel.present()` and the reader
 round with `Instant::now()` and log the elapsed time, so the "before" numbers are
 measured rather than guessed. In the same build, add `start_second_core` with an *empty*
 closure plus `.multicore_auto_park()` on the flash, and confirm Wi-Fi still associates
