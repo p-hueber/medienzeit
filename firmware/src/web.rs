@@ -159,7 +159,14 @@ pub async fn serve(stack: Stack<'static>, slot: usize) {
             continue;
         }
 
-        let saved = apply_settings(text).await;
+        // Authorised before anything is acted on. `handle` checks this too and is what
+        // renders the 401, but the settings write happens out here — so without this an
+        // unauthenticated POST would reach the flash and only then be told no.
+        let saved = if authorized(text, &auth) {
+            apply_settings(text).await
+        } else {
+            None
+        };
         let snapshot = latest();
         let response = handle(out, body, text, &auth, snapshot.as_ref(), saved);
         let _ = sock.write_all(response.as_bytes()).await;
@@ -197,6 +204,7 @@ const BODY_WARN_AT: usize = 5 * 6144 / 6;
 /// Done here rather than inside `handle` because it has to await: the flash belongs to
 /// the storage task, and the page should report the write rather than the intention.
 /// `None` means the request carried no settings.
+/// Caller must have checked authorisation: this writes to flash.
 async fn apply_settings(request: &str) -> Option<bool> {
     if !request.starts_with("POST") {
         return None;
