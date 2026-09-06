@@ -265,13 +265,6 @@ async fn main(spawner: Spawner) {
 
     let mut last_presence = Instant::now();
     loop {
-        // A rules change from the admin page arrives out of band. Persist first, so a
-        // power cut immediately after cannot leave the running rules and the stored
-        // ones disagreeing — the stored ones are what the next boot believes.
-        if let Some(new) = web::take_settings() {
-            SETTINGS_REQ.signal(new);
-        }
-
         if last_presence.elapsed() >= PRESENCE_PERIOD {
             last_presence = Instant::now();
             state.refresh_presence(&mut fb, stack).await;
@@ -286,13 +279,6 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_secs(1)).await;
     }
 }
-
-/// A settings change waiting to be written. Set by the enforcement loop, consumed by
-/// the storage task, which is the only thing holding the flash.
-static SETTINGS_REQ: embassy_sync::signal::Signal<
-    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-    medienzeit_core::settings::Settings,
-> = embassy_sync::signal::Signal::new();
 
 /// Owns the flash, and is the only thing that writes to it.
 ///
@@ -312,7 +298,7 @@ async fn storage_task(
     let mut outage_pending = recovered;
 
     loop {
-        match select(shared::PERSIST.wait(), SETTINGS_REQ.wait()).await {
+        match select(shared::PERSIST.wait(), shared::SETTINGS_REQ.wait()).await {
             Either::First((balance, t)) => {
                 journal.append(balance, t);
                 if let Some(rec) = outage_pending.take() {
@@ -320,13 +306,16 @@ async fn storage_task(
                 }
             }
             Either::Second(new) => {
-                if settings_store.save(journal.flash(), new) {
+                let ok = settings_store.save(journal.flash(), new);
+                if ok {
                     // Published only on a successful write, so the running rules can
                     // never be ones that failed to persist.
                     shared::publish_policy(new.to_policy());
                     web::publish_settings(new);
                     println!("medienzeit: rules updated");
                 }
+                // The page is waiting on this to say whether it saved.
+                shared::SETTINGS_DONE.signal(ok);
             }
         }
     }

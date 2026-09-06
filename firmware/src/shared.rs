@@ -60,6 +60,20 @@ pub fn snapshot() -> Option<Snapshot<2>> {
 /// from then on the RTC is authoritative again.
 pub static SNTP: Signal<CriticalSectionRawMutex, i64> = Signal::new();
 
+/// A settings change to write, and the result of writing it. Web → storage → web.
+///
+/// A round trip rather than a fire-and-forget so the page can report what actually
+/// happened. Without the reply it could only say "queued", which is how it used to
+/// claim success for a write that had not been attempted yet.
+pub static SETTINGS_REQ: Signal<CriticalSectionRawMutex, medienzeit_core::settings::Settings> =
+    Signal::new();
+pub static SETTINGS_DONE: Signal<CriticalSectionRawMutex, bool> = Signal::new();
+
+/// Serialises settings POSTs, because the reply above is a single cell and three
+/// acceptors could otherwise each take the other's answer.
+pub static SETTINGS_LOCK: embassy_sync::mutex::Mutex<CriticalSectionRawMutex, ()> =
+    embassy_sync::mutex::Mutex::new(());
+
 /// "Persist this balance and timestamp." Room → network, where the flash lives.
 ///
 /// A signal because journalling is edge-driven — on a flow change, or when the timer

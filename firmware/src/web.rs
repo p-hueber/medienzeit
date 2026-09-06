@@ -34,17 +34,8 @@ use medienzeit_core::{Flow, Snapshot};
 static CURRENT: Mutex<CriticalSectionRawMutex, RefCell<Option<Settings>>> =
     Mutex::new(RefCell::new(None));
 
-/// A settings change waiting for the control loop to apply and persist it.
-static PENDING: Mutex<CriticalSectionRawMutex, RefCell<Option<Settings>>> =
-    Mutex::new(RefCell::new(None));
-
 pub fn publish_settings(s: Settings) {
     CURRENT.lock(|c| *c.borrow_mut() = Some(s));
-}
-
-/// Take a pending change, if the page submitted one.
-pub fn take_settings() -> Option<Settings> {
-    PENDING.lock(|c| c.borrow_mut().take())
 }
 
 fn current_settings() -> Option<Settings> {
@@ -168,8 +159,9 @@ pub async fn serve(stack: Stack<'static>, slot: usize) {
             continue;
         }
 
+        let saved = apply_settings(text).await;
         let snapshot = latest();
-        let response = handle(out, body, text, &auth, snapshot.as_ref());
+        let response = handle(out, body, text, &auth, snapshot.as_ref(), saved);
         let _ = sock.write_all(response.as_bytes()).await;
         let _ = sock.flush().await;
         sock.close();
@@ -200,12 +192,50 @@ static BODIES: [StaticCell<String<6144>>; ACCEPTORS] = [const { StaticCell::new(
 /// for the copy to grow without anyone watching the byte count.
 const BODY_WARN_AT: usize = 5 * 6144 / 6;
 
+/// Write a submitted settings change, and wait to find out whether it stuck.
+///
+/// Done here rather than inside `handle` because it has to await: the flash belongs to
+/// the storage task, and the page should report the write rather than the intention.
+/// `None` means the request carried no settings.
+async fn apply_settings(request: &str) -> Option<bool> {
+    if !request.starts_with("POST") {
+        return None;
+    }
+    // Validated here as well as at the store, so the page can say the change was refused
+    // instead of appearing to accept it and quietly doing nothing.
+    let new = parse_settings(request)?;
+    if !new.valid() {
+        println!("web: settings change refused as invalid");
+        return Some(false);
+    }
+
+    let _turn = crate::shared::SETTINGS_LOCK.lock().await;
+    crate::shared::SETTINGS_DONE.reset();
+    crate::shared::SETTINGS_REQ.signal(new);
+    // Bounded, because a wedged storage task must not hold the acceptor open until the
+    // socket times out — one stuck save would take an acceptor out of service.
+    let ok = match embassy_time::with_timeout(
+        Duration::from_secs(3),
+        crate::shared::SETTINGS_DONE.wait(),
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(_) => {
+            println!("web: settings write did not answer in time");
+            false
+        }
+    };
+    Some(ok)
+}
+
 fn handle<'b>(
     out: &'b mut String<8192>,
     body: &mut String<6144>,
     request: &str,
     expected_auth: &str,
     snap: Option<&Snapshot<2>>,
+    saved: Option<bool>,
 ) -> &'b str {
     out.clear();
     body.clear();
@@ -222,24 +252,11 @@ fn handle<'b>(
     // Any grant arrives as a POST; the amount is capped so a stuck finger on the
     // phone cannot hand over the whole evening.
     let mut granted = 0;
-    let mut saved = None;
     if request.starts_with("POST") {
         granted = grant_minutes(request).min(60);
         if granted > 0 {
             BONUS.signal(granted * 60);
             println!("web: granted {granted} bonus minutes");
-        }
-        if let Some(new) = parse_settings(request) {
-            // Validated here as well as at the store, so the page can say the change was
-            // refused instead of appearing to accept it and quietly doing nothing.
-            if new.valid() {
-                PENDING.lock(|c| *c.borrow_mut() = Some(new));
-                saved = Some(true);
-                println!("web: settings change queued");
-            } else {
-                saved = Some(false);
-                println!("web: settings change refused as invalid");
-            }
         }
     }
 
