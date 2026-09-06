@@ -33,7 +33,18 @@ pub const HEIGHT: u32 = 200;
 const INK: BinaryColor = BinaryColor::On;
 const PAPER: BinaryColor = BinaryColor::Off;
 
-const WEEKDAYS_DE: [&str; 7] = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"];
+/// Vertical layout. With the header gone the whole screen moves up, and the space it
+/// freed goes to the dock glyphs — the one thing on here that gets read from across a
+/// room rather than up close.
+const HERO_BASELINE: i32 = 84;
+const GAUGE_Y: i32 = 100;
+/// Half-width of a dock glyph. They are deliberately large: at a glance from the door
+/// the only question is whether both devices are back, and that answer should not need
+/// squinting at a 12 px square.
+const GLYPH_R: i32 = 22;
+const GLYPH_CY: i32 = 146;
+const GLYPH_STROKE: u32 = 7;
+const NAME_Y: i32 = 181;
 
 /// Everything the screen needs beyond the ledger snapshot.
 pub struct Chrome<'a> {
@@ -88,7 +99,6 @@ where
     let (bg, fg) = if locked { (INK, PAPER) } else { (PAPER, INK) };
 
     target.clear(bg)?;
-    header(target, snap, fg)?;
 
     if locked {
         lockout(target, snap, fg)?;
@@ -102,41 +112,6 @@ where
     Ok(())
 }
 
-fn header<D>(target: &mut D, snap: &Snapshot<2>, fg: BinaryColor) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = BinaryColor>,
-{
-    let _ = small_font().render_aligned(
-        "MEDIENZEIT",
-        Point::new(6, 4),
-        VerticalPosition::Top,
-        HorizontalAlignment::Left,
-        FontColor::Transparent(fg),
-        target,
-    );
-
-    let mut clock: String<16> = String::new();
-    let _ = write!(
-        clock,
-        "{} {:02}:{:02}",
-        WEEKDAYS_DE[snap.local.weekday as usize % 7],
-        snap.local.hour,
-        snap.local.minute
-    );
-    let _ = small_font().render_aligned(
-        clock.as_str(),
-        Point::new(WIDTH as i32 - 6, 4),
-        VerticalPosition::Top,
-        HorizontalAlignment::Right,
-        FontColor::Transparent(fg),
-        target,
-    );
-
-    Line::new(Point::new(6, 18), Point::new(WIDTH as i32 - 7, 18))
-        .into_styled(PrimitiveStyle::with_stroke(fg, 1))
-        .draw(target)
-}
-
 /// Night, or out of balance. Says what is happening and what to do about it.
 fn lockout<D>(target: &mut D, snap: &Snapshot<2>, fg: BinaryColor) -> Result<(), D::Error>
 where
@@ -147,7 +122,7 @@ where
 
     let _ = title_font().render_aligned(
         title,
-        Point::new(cx, 70),
+        Point::new(cx, 52),
         VerticalPosition::Center,
         HorizontalAlignment::Center,
         FontColor::Transparent(fg),
@@ -166,7 +141,7 @@ where
     }
     let _ = label_font().render_aligned(
         sub.as_str(),
-        Point::new(cx, 102),
+        Point::new(cx, 84),
         VerticalPosition::Center,
         HorizontalAlignment::Center,
         FontColor::Transparent(fg),
@@ -176,7 +151,7 @@ where
     if snap.balance_secs < 0 && !snap.docked.iter().all(|d| *d) {
         let _ = small_font().render_aligned(
             "zurücklegen",
-            Point::new(cx, 124),
+            Point::new(cx, 106),
             VerticalPosition::Center,
             HorizontalAlignment::Center,
             FontColor::Transparent(fg),
@@ -200,21 +175,34 @@ where
         let _ = write!(big, "{mins}");
     }
 
+    // The unit rides on the end of the number instead of taking a line of its own, so
+    // the glyphs below can have the height instead. Measured rather than guessed: the
+    // pair is centred as a unit, or the number drifts left as it gains digits.
+    let unit = if mins >= 60 { "h" } else { "min" };
+    let num_w = hero_font()
+        .get_rendered_dimensions(big.as_str(), Point::zero(), VerticalPosition::Baseline)
+        .map(|d| d.advance.x)
+        .unwrap_or(0);
+    let unit_w = title_font()
+        .get_rendered_dimensions(unit, Point::zero(), VerticalPosition::Baseline)
+        .map(|d| d.advance.x)
+        .unwrap_or(0);
+    const GAP: i32 = 6;
+    let left = cx - (num_w + GAP + unit_w) / 2;
+
     let _ = hero_font().render_aligned(
         big.as_str(),
-        Point::new(cx, 82),
-        VerticalPosition::Center,
-        HorizontalAlignment::Center,
+        Point::new(left, HERO_BASELINE),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Left,
         FontColor::Transparent(fg),
         target,
     );
-
-    let unit = if mins >= 60 { "Stunden" } else { "Minuten" };
-    let _ = label_font().render_aligned(
+    let _ = title_font().render_aligned(
         unit,
-        Point::new(cx, 124),
-        VerticalPosition::Center,
-        HorizontalAlignment::Center,
+        Point::new(left + num_w + GAP, HERO_BASELINE),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Left,
         FontColor::Transparent(fg),
         target,
     );
@@ -227,7 +215,7 @@ where
     D: DrawTarget<Color = BinaryColor>,
 {
     let outline = RoundedRectangle::with_equal_corners(
-        Rectangle::new(Point::new(6, 138), Size::new(WIDTH - 12, 16)),
+        Rectangle::new(Point::new(6, GAUGE_Y), Size::new(WIDTH - 12, 16)),
         Size::new(3, 3),
     );
     outline
@@ -245,7 +233,7 @@ where
         let filled = (snap.balance_secs as u64).min(snap.cap_secs as u64) * inner_w as u64
             / snap.cap_secs as u64;
         if filled > 0 {
-            Rectangle::new(Point::new(8, 140), Size::new(filled as u32, 12))
+            Rectangle::new(Point::new(8, GAUGE_Y + 2), Size::new(filled as u32, 12))
                 .into_styled(PrimitiveStyle::with_fill(fg))
                 .draw(target)?;
         }
@@ -264,26 +252,57 @@ where
 {
     let half = WIDTH as i32 / 2;
     for (i, name) in chrome.device_names.iter().enumerate() {
-        let x = 8 + i as i32 * half;
-
-        // Filled square = within the reader's field, hollow = taken away.
-        let box_rect = Rectangle::new(Point::new(x, 168), Size::new(12, 12));
+        let cx = half / 2 + i as i32 * half;
         if snap.docked[i] {
-            box_rect.into_styled(PrimitiveStyle::with_fill(fg)).draw(target)?;
+            check(target, cx, GLYPH_CY, fg)?;
         } else {
-            box_rect.into_styled(PrimitiveStyle::with_stroke(fg, 1)).draw(target)?;
+            cross(target, cx, GLYPH_CY, fg)?;
         }
-
         let _ = label_font().render_aligned(
             *name,
-            Point::new(x + 18, 174),
+            Point::new(cx, NAME_Y),
             VerticalPosition::Center,
-            HorizontalAlignment::Left,
+            HorizontalAlignment::Center,
             FontColor::Transparent(fg),
             target,
         );
     }
     Ok(())
+}
+
+fn glyph_style(fg: BinaryColor) -> PrimitiveStyle<BinaryColor> {
+    PrimitiveStyle::with_stroke(fg, GLYPH_STROKE)
+}
+
+/// Put back. The long arm runs up to the right, which is what makes it read as a tick
+/// rather than as an angle.
+fn check<D>(target: &mut D, cx: i32, cy: i32, fg: BinaryColor) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let style = glyph_style(fg);
+    let elbow = Point::new(cx - GLYPH_R / 4, cy + GLYPH_R * 3 / 5);
+    Line::new(Point::new(cx - GLYPH_R, cy + GLYPH_R / 8), elbow)
+        .into_styled(style)
+        .draw(target)?;
+    Line::new(elbow, Point::new(cx + GLYPH_R, cy - GLYPH_R * 3 / 4))
+        .into_styled(style)
+        .draw(target)
+}
+
+/// Taken away.
+fn cross<D>(target: &mut D, cx: i32, cy: i32, fg: BinaryColor) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let style = glyph_style(fg);
+    let r = GLYPH_R * 4 / 5;
+    Line::new(Point::new(cx - r, cy - r), Point::new(cx + r, cy + r))
+        .into_styled(style)
+        .draw(target)?;
+    Line::new(Point::new(cx + r, cy - r), Point::new(cx - r, cy + r))
+        .into_styled(style)
+        .draw(target)
 }
 
 /// The bottom of the screen says what the balance is doing, wordlessly — no text to
@@ -296,7 +315,7 @@ fn flow_cue<D>(target: &mut D, snap: &Snapshot<2>, fg: BinaryColor) -> Result<()
 where
     D: DrawTarget<Color = BinaryColor>,
 {
-    let y = 192;
+    let y = 195;
     let right = WIDTH as i32 - 7;
     let cx = WIDTH as i32 / 2;
 
