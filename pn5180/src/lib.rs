@@ -97,6 +97,14 @@ pub mod eeprom {
 /// rather than hangs.
 const BUSY_TIMEOUT_STEPS: u32 = 5_000; // ~500 ms
 
+/// What one `read_register` costs, wall clock, at 1 MHz SPI with the BUSY handshake.
+///
+/// Measured on hardware rather than derived: the SPI traffic is 48 us of it and the
+/// handshake is the rest. Used to turn a requested timeout into a number of polls, since
+/// polling *is* the clock in a driver with no timer of its own. If the SPI clock changes,
+/// this is wrong and every timeout silently changes with it.
+pub const POLL_COST_US: u32 = 263;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// The SPI transfer itself failed.
@@ -555,12 +563,20 @@ where
     /// Wait for a frame, and return its length. `None` means nothing answered, which for
     /// an inventory slot is the ordinary case rather than an error.
     fn await_frame(&mut self, timeout_us: u32) -> Result<Option<usize>, Error> {
-        let steps = timeout_us / 100;
+        // Each poll is a register read over SPI, and that read is not free: measured at
+        // 263 us on hardware, against 48 us of actual SPI at 1 MHz — the rest is the
+        // BUSY handshake. Sleeping another 100 us on top bought nothing and made the
+        // real timeout 3.6x what the caller asked for, which is how a 16-slot round of
+        // nominally 160 ms came to take 580 ms.
+        //
+        // So the poll paces itself and the step count is derived from what a poll
+        // actually costs. Conservative on purpose: overestimating the cost undershoots
+        // the timeout, and this number is only correct for the SPI clock in use.
+        let steps = timeout_us.div_ceil(POLL_COST_US);
         for _ in 0..steps {
             if self.read_register(reg::IRQ_STATUS)? & RX_IRQ != 0 {
                 return Ok(Some(self.rx_len()?));
             }
-            self.delay.delay_us(100);
         }
         Ok(None)
     }
