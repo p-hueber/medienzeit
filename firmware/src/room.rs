@@ -99,6 +99,11 @@ impl Room {
 
     /// One pass: read the world, fold it into the ledger, act on the result.
     pub fn step(&mut self) {
+        // First, and before any lock is taken: core 0 hardware-stalls this core to write
+        // flash, and doing that while we hold a lock deadlocks both cores. See
+        // `flashlock`. Cheap when nothing is pending.
+        crate::flashlock::yield_if_asked();
+
         self.take_clock_correction();
         self.take_policy_change();
 

@@ -2,6 +2,7 @@
 #![no_main]
 
 mod chime;
+mod flashlock;
 mod fritzbox;
 mod net;
 mod notify;
@@ -300,13 +301,19 @@ async fn storage_task(
     loop {
         match select(shared::PERSIST.wait(), shared::SETTINGS_REQ.wait()).await {
             Either::First((balance, t)) => {
-                journal.append(balance, t);
-                if let Some(rec) = outage_pending.take() {
-                    report_outage(rec.last_tick, t);
+                if with_room_parked(|| journal.append(balance, t)).await.is_some() {
+                    if let Some(rec) = outage_pending.take() {
+                        report_outage(rec.last_tick, t);
+                    }
+                } else {
+                    // Not fatal: the room asks again within JOURNAL_PERIOD.
+                    println!("journal: skipped, the room did not park");
                 }
             }
             Either::Second(new) => {
-                let ok = settings_store.save(journal.flash(), new);
+                let ok = with_room_parked(|| settings_store.save(journal.flash(), new))
+                    .await
+                    .unwrap_or(false);
                 if ok {
                     // Published only on a successful write, so the running rules can
                     // never be ones that failed to persist.
@@ -319,6 +326,32 @@ async fn storage_task(
             }
         }
     }
+}
+
+/// Run a flash write with the room parked somewhere safe.
+///
+/// `esp-storage` will hardware-stall core 1 for the duration of the write. That is only
+/// survivable if core 1 is holding no lock when it happens, which is what
+/// [`flashlock`] arranges — see that module for why this is not optional.
+///
+/// `None` means the room never parked and **the write did not happen**. Writing anyway
+/// would be choosing a deadlock over a missed record, and the record comes round again.
+async fn with_room_parked<R>(f: impl FnOnce() -> R) -> Option<R> {
+    flashlock::request();
+    // The room checks once per iteration, so this can take a full period — longer if it
+    // is mid-refresh, which is nearly two seconds. Bounded comfortably past that.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !flashlock::room_is_parked() {
+        if Instant::now() > deadline {
+            flashlock::release();
+            println!("flash: the room did not park in time");
+            return None;
+        }
+        Timer::after(Duration::from_millis(2)).await;
+    }
+    let out = f();
+    flashlock::release();
+    Some(out)
 }
 
 /// Report how long the unit was off.
