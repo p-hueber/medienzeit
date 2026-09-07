@@ -2,7 +2,6 @@
 #![no_main]
 
 mod chime;
-mod flashlock;
 mod fritzbox;
 mod net;
 mod notify;
@@ -167,27 +166,19 @@ async fn main(spawner: Spawner) {
         None => Ledger::<2>::new(&policy),
     };
 
-    // Everything that blocks now lives behind this one object, and everything it
-    // exchanges with the async half goes through `shared`. Moving it to core 1 is
-    // therefore a change of where `step` is called from, and nothing else.
+    // Everything that blocks lives behind this one object, and everything it exchanges
+    // with the async half goes through `shared`. The separation is worth keeping on its
+    // own terms — it is what made the redraw decision testable — but it runs here, on
+    // the one core, as a task like any other.
+    //
+    // It used to run on core 1. That is reverted, and must not be reinstated without
+    // solving what broke it: `esp-storage` hardware-stalls the other core before every
+    // flash write, and both attempts at making that safe deadlocked the device in
+    // service. See `two-core-deadlock` and `docs/two-core-split.md`.
     let room = room::Room::new(
         panel, nfc, scan, docking, boot_button, chime, i2c, ledger, policy,
     );
-    // Core 1 is the room. It gets every blocking driver and the ledger, and runs a
-    // plain synchronous loop with no executor; core 0 keeps the network stack and stays
-    // async. The two meet only through `shared`.
-    //
-    // In a StaticCell rather than moved into the closure so the object lives in .bss
-    // and core 1's stack only has to cover call frames.
-    static ROOM: StaticCell<room::Room> = StaticCell::new();
-    static ROOM_STACK: StaticCell<esp_hal::system::Stack<12288>> = StaticCell::new();
-    let room = ROOM.init(room);
-    esp_rtos::start_second_core(
-        p.CPU_CTRL,
-        sw.software_interrupt1,
-        ROOM_STACK.init(esp_hal::system::Stack::new()),
-        move || room.run(),
-    );
+    spawner.spawn(room::task(room).unwrap());
 
     // --- radio + network -------------------------------------------------
     let (controller, interfaces) =
@@ -301,19 +292,13 @@ async fn storage_task(
     loop {
         match select(shared::PERSIST.wait(), shared::SETTINGS_REQ.wait()).await {
             Either::First((balance, t)) => {
-                if with_room_parked(|| journal.append(balance, t)).await.is_some() {
-                    if let Some(rec) = outage_pending.take() {
-                        report_outage(rec.last_tick, t);
-                    }
-                } else {
-                    // Not fatal: the room asks again within JOURNAL_PERIOD.
-                    println!("journal: skipped, the room did not park");
+                journal.append(balance, t);
+                if let Some(rec) = outage_pending.take() {
+                    report_outage(rec.last_tick, t);
                 }
             }
             Either::Second(new) => {
-                let ok = with_room_parked(|| settings_store.save(journal.flash(), new))
-                    .await
-                    .unwrap_or(false);
+                let ok = settings_store.save(journal.flash(), new);
                 if ok {
                     // Published only on a successful write, so the running rules can
                     // never be ones that failed to persist.
@@ -326,32 +311,6 @@ async fn storage_task(
             }
         }
     }
-}
-
-/// Run a flash write with the room parked somewhere safe.
-///
-/// `esp-storage` will hardware-stall core 1 for the duration of the write. That is only
-/// survivable if core 1 is holding no lock when it happens, which is what
-/// [`flashlock`] arranges — see that module for why this is not optional.
-///
-/// `None` means the room never parked and **the write did not happen**. Writing anyway
-/// would be choosing a deadlock over a missed record, and the record comes round again.
-async fn with_room_parked<R>(f: impl FnOnce() -> R) -> Option<R> {
-    flashlock::request();
-    // The room checks once per iteration, so this can take a full period — longer if it
-    // is mid-refresh, which is nearly two seconds. Bounded comfortably past that.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !flashlock::room_is_parked() {
-        if Instant::now() > deadline {
-            flashlock::release();
-            println!("flash: the room did not park in time");
-            return None;
-        }
-        Timer::after(Duration::from_millis(2)).await;
-    }
-    let out = f();
-    flashlock::release();
-    Some(out)
 }
 
 /// Report how long the unit was off.

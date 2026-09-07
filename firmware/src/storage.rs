@@ -41,15 +41,12 @@ pub struct Journal<'a> {
 impl<'a> Journal<'a> {
     /// Open the region and recover the newest surviving record.
     pub fn open(flash: esp_hal::peripherals::FLASH<'a>) -> (Self, Option<Record>) {
-        // Writing to flash stops the other core fetching instructions from it, so
-        // esp-storage refuses the write outright while that core runs — the default is
-        // `MultiCoreStrategy::Error`, and every journal append would fail the moment
-        // core 1 exists. Auto-park suspends it for the write instead.
-        //
-        // The stall lands on core 1 rather than the network stack, which is why flash
-        // stays here: parking is symmetric, its cost is not. See
-        // `docs/two-core-split.md`.
-        let mut flash = FlashStorage::new(flash).multicore_auto_park();
+        // Deliberately left on the default `MultiCoreStrategy::Error`. It refuses to
+        // write while another core runs, which is exactly the check we want: this
+        // firmware is single-core, and if that ever stops being true the journal must
+        // fail loudly rather than resume hardware-stalling a core mid-lock. That is what
+        // deadlocked the device twice — see `docs/two-core-split.md`.
+        let mut flash = FlashStorage::new(flash);
         let mut best: Option<(usize, Record)> = None;
 
         let mut buf = [0u8; RECORD_LEN];

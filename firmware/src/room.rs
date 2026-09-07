@@ -99,11 +99,6 @@ impl Room {
 
     /// One pass: read the world, fold it into the ledger, act on the result.
     pub fn step(&mut self) {
-        // First, and before any lock is taken: core 0 hardware-stalls this core to write
-        // flash, and doing that while we hold a lock deadlocks both cores. See
-        // `flashlock`. Cheap when nothing is pending.
-        crate::flashlock::yield_if_asked();
-
         self.take_clock_correction();
         self.take_policy_change();
 
@@ -145,33 +140,6 @@ impl Room {
         self.redraw(&snapshot);
         shared::publish_snapshot(snapshot.clone());
         self.maybe_persist(&snapshot, t);
-    }
-
-    /// Run the room forever. This is core 1's main thread.
-    ///
-    /// Paced to a deadline rather than by sleeping a second at the end, because the work
-    /// takes a large and variable fraction of the period: a redraw is about a second on its
-    /// own, so `delay(1s)` after the work would make the real cadence closer to two.
-    ///
-    /// A late iteration gives up the beat it missed instead of running twice to catch up.
-    /// Nothing is owed — `Ledger::tick` bills from the RTC timestamp, so a skipped beat
-    /// costs no time, and running two reader rounds back to back would only make the
-    /// overrun worse.
-    pub fn run(&mut self) -> ! {
-        use esp_hal::time::{Duration, Instant};
-        const PERIOD: Duration = Duration::from_secs(1);
-
-        // Done here rather than by the caller so core 0 is not held up by a full refresh,
-        // which is the better part of two seconds.
-        self.show_startup();
-
-        let mut next = Instant::now() + PERIOD;
-        loop {
-            esp_rtos::CurrentThreadHandle::get().delay_until(next);
-            self.step();
-            let now = Instant::now();
-            next = if next > now { next + PERIOD } else { now + PERIOD };
-        }
     }
 
     /// Redraw the panel if what it shows has changed.
@@ -341,3 +309,19 @@ const _: () = {
         panic!("Room is too large to construct as a local; give its buffers their own statics");
     }
 };
+
+/// Drives [`Room::step`] at 1 Hz.
+///
+/// A task on the one core, blocking the executor for the length of a redraw exactly as
+/// the old control loop did. `step` is a method rather than a loop so the caller owns
+/// the pacing — that shape was what let the room move to core 1, and it is what would
+/// let it move again if the flash-write stall is ever solved.
+#[embassy_executor::task]
+pub async fn task(mut room: Room) {
+    room.show_startup();
+    let mut ticker = embassy_time::Ticker::every(embassy_time::Duration::from_secs(1));
+    loop {
+        ticker.next().await;
+        room.step();
+    }
+}
