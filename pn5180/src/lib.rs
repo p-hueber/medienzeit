@@ -564,20 +564,27 @@ where
     /// Wait for a frame, and return its length. `None` means nothing answered, which for
     /// an inventory slot is the ordinary case rather than an error.
     fn await_frame(&mut self, timeout_us: u32) -> Result<Option<usize>, Error> {
-        // Each poll is a register read over SPI, and that read is not free: measured at
-        // 263 us on hardware, against 48 us of actual SPI at 1 MHz — the rest is the
-        // BUSY handshake. Sleeping another 100 us on top bought nothing and made the
-        // real timeout 3.6x what the caller asked for, which is how a 16-slot round of
-        // nominally 160 ms came to take 580 ms.
+        // Deliberately back to the original loop, sleep and all.
         //
-        // So the poll paces itself and the step count is derived from what a poll
-        // actually costs. Conservative on purpose: overestimating the cost undershoots
-        // the timeout, and this number is only correct for the SPI clock in use.
-        let steps = timeout_us.div_ceil(POLL_COST_US);
+        // The sleep looks redundant — a poll is a register read costing 263 us measured,
+        // so the 100 us on top only pads it — and removing it was supposed to make the
+        // timeout mean what it said. It also made the SPI continuous for the whole of
+        // the tag's reply window instead of leaving a gap between every read. On this
+        // board that is not free: the link is dupont wiring that flips bits often enough
+        // to have forced the SPI clock down to 1 MHz, and the receiver is a few
+        // centimetres away from it.
+        //
+        // Every successful read this project has made was against this loop, at 100
+        // steps of ~363 us. Two attempts at improving it produced a reader that found
+        // nothing at all. So the shape stays until there is a tag on the coil to measure
+        // against, and `POLL_COST_US` is kept only for the boot bench that watches the
+        // SPI clock for drift.
+        let steps = timeout_us / 100;
         for _ in 0..steps {
             if self.read_register(reg::IRQ_STATUS)? & RX_IRQ != 0 {
                 return Ok(Some(self.rx_len()?));
             }
+            self.delay.delay_us(100);
         }
         Ok(None)
     }
